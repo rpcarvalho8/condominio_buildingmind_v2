@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useLocation } from "wouter";
 import { PageHeader } from "../components/Layout";
 import {
@@ -125,6 +126,7 @@ function BankPanel() {
   const [customFrom, setCustomFrom] = useState("2026-02-01");
   const [customTo, setCustomTo] = useState(new Date().toISOString().slice(0, 10));
   const [, navigate] = useLocation();
+  const queryClient = useQueryClient();
 
   const loadStatus = useCallback(async () => {
     setLoading(true);
@@ -178,6 +180,8 @@ function BankPanel() {
       const data = await res.json() as SyncResult;
       setSyncResult(data);
       await loadStatus();
+      // Invalidar todas as queries para forçar reload da UI com dados frescos
+      await queryClient.invalidateQueries();
     } catch (e: any) {
       setSyncResult({ error: e.message });
     }
@@ -375,9 +379,21 @@ function BankPanel() {
                   ? <>
                       <span className="font-medium">{syncResult.transactionsFound} transações encontradas</span>
                       {(syncResult as any).period && ` (${(syncResult as any).period.from} → ${(syncResult as any).period.to})`}
-                      {" · "}{syncResult.despesasCreated ?? 0} despesas · {(syncResult.quotasCreated ?? 0) + (syncResult.quotasUpdated ?? 0)} quotas
+                      {" · "}{syncResult.despesasCreated ?? 0} despesas criadas
+                      {" · "}{syncResult.quotasCreated ?? 0} quotas criadas
+                      {(syncResult.quotasUpdated ?? 0) > 0 && ` · ${syncResult.quotasUpdated} quotas atualizadas`}
+                      {(syncResult.despesasSkipped ?? 0) > 0 && ` · ${syncResult.despesasSkipped} ignoradas`}
                       {syncResult.syncErrors && syncResult.syncErrors.length > 0 && (
-                        <div className="mt-1 opacity-75">{syncResult.syncErrors.join("; ")}</div>
+                        <div className="mt-1 opacity-75">Erros API: {syncResult.syncErrors.join("; ")}</div>
+                      )}
+                      {syncResult.errors && syncResult.errors.length > 0 && (
+                        <details className="mt-1">
+                          <summary className="cursor-pointer opacity-75">{syncResult.errors.length} avisos de importação</summary>
+                          <div className="mt-1 opacity-75 space-y-0.5">
+                            {syncResult.errors.slice(0, 10).map((e, i) => <div key={i}>• {e}</div>)}
+                            {syncResult.errors.length > 10 && <div>…e mais {syncResult.errors.length - 10}</div>}
+                          </div>
+                        </details>
                       )}
                     </>
                   : "Ligação bancária estabelecida com sucesso"}
@@ -421,6 +437,7 @@ export default function ImportarPage() {
   const [logs, setLogs]               = useState<ImportLog[]>([]);
   const [logsLoading, setLogsLoading] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const queryClient = useQueryClient();
 
   const loadLogs = useCallback(async () => {
     setLogsLoading(true);
@@ -447,7 +464,10 @@ export default function ImportarPage() {
       const res = await authFetch("/api/import/movimentos", { method: "POST", body: form });
       const data = await res.json() as ImportResult;
       setResult(data);
-      if (data.ok) loadLogs();
+      if (data.ok) {
+        loadLogs();
+        await queryClient.invalidateQueries();
+      }
     } catch (err: any) {
       setResult({ error: err.message ?? "Erro desconhecido" });
     }

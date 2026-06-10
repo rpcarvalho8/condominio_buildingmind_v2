@@ -14,7 +14,7 @@ import { Hono } from "hono";
 import { requireAdmin } from "../middleware/auth";
 import { db } from "../database";
 import * as schema from "../database/schema";
-import { eq, desc } from "drizzle-orm";
+import { eq, desc, and } from "drizzle-orm";
 import crypto from "node:crypto";
 
 const CLIENT_ID = process.env.ENABLE_BANKING_CLIENT_ID ?? "";
@@ -301,7 +301,12 @@ async function importTransactions(transactions: any[]): Promise<{
   for (const q of quotasToUpdate) {
     await db.update(schema.quotas)
       .set({ pago: true, valor: q.valor, dataPagamento: q.data, metodoPagamento: "transferência" })
-      .where(eq(schema.quotas.fracaoId, q.fracaoId));
+      .where(and(
+        eq(schema.quotas.fracaoId, q.fracaoId),
+        eq(schema.quotas.mes, q.mes),
+        eq(schema.quotas.ano, q.ano),
+        eq(schema.quotas.tipo, q.tipo),
+      ));
   }
 
   return results;
