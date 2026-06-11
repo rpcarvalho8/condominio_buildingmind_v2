@@ -16,6 +16,7 @@ import { db } from "../database";
 import * as schema from "../database/schema";
 import { eq, desc, and } from "drizzle-orm";
 import crypto from "node:crypto";
+import { recalcularSaldos } from "./dashboard";
 
 const CLIENT_ID = process.env.ENABLE_BANKING_CLIENT_ID ?? "";
 // Support both literal newlines and \n escape sequences in .env
@@ -490,6 +491,15 @@ export const bankRoutes = new Hono()
       importResults = await importTransactions(allTransactions);
     }
 
+    // Recalcular e persistir saldos em configuracoes após o sync
+    // Garante que o dashboard reflicte os dados actualizados na próxima query
+    try {
+      await recalcularSaldos();
+    } catch (e: any) {
+      console.error("[bank/sync] Erro ao recalcular saldos:", e.message);
+      importResults.errors.push(`recalcularSaldos: ${e.message}`);
+    }
+
     // Log the sync
     await db.insert(schema.bankSyncLogs).values({
       connectionId: connection.id,
@@ -563,6 +573,12 @@ export async function runBankSync(): Promise<void> {
   let importResults = { despesasCreated: 0, quotasCreated: 0, quotasUpdated: 0, despesasSkipped: 0, errors: [] as string[] };
   if (allTransactions.length > 0) {
     importResults = await importTransactions(allTransactions);
+  }
+
+  try {
+    await recalcularSaldos();
+  } catch (e: any) {
+    console.error("[bank-cron] Erro ao recalcular saldos:", e.message);
   }
 
   await db.insert(schema.bankSyncLogs).values({
