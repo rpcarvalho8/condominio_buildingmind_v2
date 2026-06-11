@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { getToken } from "../lib/auth";
 import { PageHeader } from "../components/Layout";
@@ -197,10 +197,7 @@ export default function MovimentosBancariosPage() {
   const [filterFracao, setFilterFracao] = useState("");
   const [filterTipo, setFilterTipo]     = useState("");
   const [filterSource, setFilterSource] = useState("");
-  const [page, setPage]                 = useState(1);
-  const [movimentos, setMovimentos]     = useState<Movement[]>([]);
-  const [totalMov, setTotalMov]         = useState(0);
-  const [movLoading, setMovLoading]     = useState(false);
+  const [page, setPage] = useState(1);
 
   // Overview data
   const { data: overview } = useQuery({
@@ -232,23 +229,23 @@ export default function MovimentosBancariosPage() {
   const fracoes: FracaoResumo[] = fracoesData?.resumo ?? [];
   const categorias: { categoria: string; count: number; total: number }[] = catData?.categorias ?? [];
 
-  // Movimentos with filters
-  const loadMovimentos = useCallback(async (p: number) => {
-    setMovLoading(true);
-    const params = new URLSearchParams({ page: String(p), pageSize: "50" });
-    if (filterCat)    params.set("categoria", filterCat);
-    if (filterFracao) params.set("fracao", filterFracao);
-    if (filterTipo)   params.set("tipo", filterTipo);
-    if (filterSource) params.set("source", filterSource);
-    const d = await apiFetch<any>(`/api/bank-movements/condominio?${params}`);
-    setMovimentos(d.movimentos ?? []);
-    setTotalMov(d.total ?? 0);
-    setMovLoading(false);
-  }, [filterCat, filterFracao, filterTipo, filterSource]);
+  // Movimentos — dentro do React Query para responder a invalidateQueries()
+  const { data: movData, isLoading: movLoading } = useQuery({
+    queryKey: ["bank-movements-lista", page, filterCat, filterFracao, filterTipo, filterSource],
+    queryFn: async () => {
+      const params = new URLSearchParams({ page: String(page), pageSize: "50" });
+      if (filterCat)    params.set("categoria", filterCat);
+      if (filterFracao) params.set("fracao", filterFracao);
+      if (filterTipo)   params.set("tipo", filterTipo);
+      if (filterSource) params.set("source", filterSource);
+      return apiFetch<any>(`/api/bank-movements/condominio?${params}`);
+    },
+    enabled: tab === "movimentos",
+    staleTime: 30_000,
+  });
 
-  useEffect(() => {
-    if (tab === "movimentos") { setPage(1); loadMovimentos(1); }
-  }, [tab, filterCat, filterFracao, filterTipo, filterSource]);
+  const movimentos: Movement[] = movData?.movimentos ?? [];
+  const totalMov: number = movData?.total ?? 0;
 
   const TABS = [
     { id: "overview",       label: "Resumo" },
@@ -483,7 +480,7 @@ export default function MovimentosBancariosPage() {
               <div className="px-4 py-3 border-t flex items-center justify-between">
                 <button
                   disabled={page <= 1}
-                  onClick={() => { const p = page - 1; setPage(p); loadMovimentos(p); }}
+                  onClick={() => setPage(p => p - 1)}
                   className="text-sm px-3 py-1.5 border rounded-lg disabled:opacity-40 hover:bg-gray-50"
                 >
                   ← Anterior
@@ -493,7 +490,7 @@ export default function MovimentosBancariosPage() {
                 </span>
                 <button
                   disabled={page * 50 >= totalMov}
-                  onClick={() => { const p = page + 1; setPage(p); loadMovimentos(p); }}
+                  onClick={() => setPage(p => p + 1)}
                   className="text-sm px-3 py-1.5 border rounded-lg disabled:opacity-40 hover:bg-gray-50"
                 >
                   Seguinte →
