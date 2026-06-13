@@ -154,7 +154,7 @@ const FUNDO_RESERVA_DEVEDORES_EXCEL = [
 //   O totalEmAtraso real de quotas = Excel total - 213.99 (L já liquidou quota corrente)
 //   atraso_fundo_reserva: 28.41 Excel → corrigido: 28.41 - 23.99 (L pré-2026 fundo) + 2.79 (L Jan fundo resto) = 7.21
 const SALDO_DEFAULTS: Record<string, number> = {
-  saldo_conta_corrente: 2778.86,
+  saldo_conta_corrente: 3388.39, // saldo base confirmado 2026-06-13
   saldo_fundo_reserva: 277.89,
   atraso_fundo_reserva: 7.21,  // corrigido: L pagou 25.47 (23.99 pre-2026 fundo + parcial Jan)
   saldo_obras: 26912.37,
@@ -206,8 +206,45 @@ async function upsertSaldo(chave: string, valor: number): Promise<void> {
  *  - portao / incendio: a_receber recalculado (Excel − pagos DB)
  */
 export async function recalcularSaldos(): Promise<void> {
-  // Nota: saldo_conta_corrente e saldo_obras são saldos bancários reais —
-  // não são sobrescritos aqui; requerem conciliação manual.
+  // ── Conta corrente: saldo_base + quotas_pagas_desde_base − despesas_desde_base ──
+  // saldo_base_valor e saldo_base_data são gravados em configuracoes sempre que
+  // o saldo real é confirmado (via Definições ou importação Excel).
+  try {
+    const cfgRows = await db.select().from(schema.configuracoes);
+    const cfg = Object.fromEntries(cfgRows.map(r => [r.chave, r.valor]));
+    const saldoBase = parseFloat(cfg.saldo_base_valor ?? "0");
+    const saldoBaseData = cfg.saldo_base_data; // "YYYY-MM-DD"
+
+    if (saldoBase > 0 && saldoBaseData) {
+      const baseTs = Math.floor(new Date(saldoBaseData).getTime() / 1000);
+
+      // Quotas condomínio pagas desde a data base
+      const quotasDesdeBase = await db
+        .select({ valor: schema.quotas.valor, fundoReserva: schema.quotas.fundoReserva })
+        .from(schema.quotas)
+        .where(and(
+          eq(schema.quotas.tipo, "condominio"),
+          eq(schema.quotas.pago, true),
+          sql`${schema.quotas.dataPagamento} >= ${baseTs}`,
+        ));
+      const receitasDesdeBase = quotasDesdeBase.reduce(
+        (s, q) => s + q.valor + (q.fundoReserva ?? 0), 0
+      );
+
+      // Despesas desde a data base
+      const despesasDesdeBase = await db
+        .select({ valor: schema.despesas.valor })
+        .from(schema.despesas)
+        .where(sql`${schema.despesas.data} >= ${baseTs}`);
+      const totalDespesasDesdeBase = despesasDesdeBase.reduce((s, d) => s + d.valor, 0);
+
+      const saldoCorrente = saldoBase + receitasDesdeBase - totalDespesasDesdeBase;
+      await upsertSaldo("saldo_conta_corrente", Math.round(saldoCorrente * 100) / 100);
+    }
+  } catch (e) {
+    // falha silenciosa — saldo_conta_corrente mantém último valor
+    console.error("[recalcularSaldos] saldo_conta_corrente:", e);
+  }
 
   // ── Obras: a_receber da DB ──────────────────────────────────────────────────
   const obrasEmAtraso = await db

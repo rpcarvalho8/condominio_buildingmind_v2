@@ -107,10 +107,16 @@ function isMotorGaragemDesc(desc: string): boolean {
   return /MOTOR\s+GARAGEM/i.test(desc);
 }
 
-// dedup key
+// dedup key — primária por descrição normalizada + valor + dia
 function despesaKey(desc: string, valor: number, date: Date): string {
   const day = `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
   return `${desc}|${valor.toFixed(2)}|${day}`;
+}
+
+// dedup secundária — valor + dia (ignora descrição; evita duplicados CSV manual vs bank sync)
+function despesaKeyValorData(valor: number, date: Date): string {
+  const day = `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+  return `${valor.toFixed(2)}|${day}`;
 }
 
 // ─── Transaction import logic ─────────────────────────────────────────────────
@@ -152,9 +158,11 @@ async function importTransactions(transactions: any[]): Promise<{
 
   const fracaoByNum = new Map(allFracoes.map(f => [f.numero.toUpperCase(), f]));
   const despesaKeys = new Set<string>();
+  const despesaKeysValorData = new Set<string>(); // dedup secundário valor+data
   for (const d of existingDespesas) {
     const dDate = d.data instanceof Date ? d.data : new Date((d.data as number) * 1000);
     despesaKeys.add(despesaKey(d.descricao, d.valor, dDate));
+    despesaKeysValorData.add(despesaKeyValorData(d.valor, dDate));
   }
   const quotaKeys = new Set<string>(existingQuotas.map(q => `${q.fracaoId}|${q.mes}|${q.ano}|${q.tipo}`));
 
@@ -278,8 +286,11 @@ async function importTransactions(transactions: any[]): Promise<{
       } else {
         // Saída — despesa
         const dKey = despesaKey(desc, valor, date);
-        if (despesaKeys.has(dKey)) { results.despesasSkipped++; continue; }
+        const dKeyVD = despesaKeyValorData(valor, date);
+        // dedup primário: desc+valor+data; secundário: valor+data (evita CSV manual vs bank sync)
+        if (despesaKeys.has(dKey) || despesaKeysValorData.has(dKeyVD)) { results.despesasSkipped++; continue; }
         despesaKeys.add(dKey);
+        despesaKeysValorData.add(dKeyVD);
         despesasToInsert.push({
           descricao: desc,
           categoria: inferCatFromDesc(desc),
