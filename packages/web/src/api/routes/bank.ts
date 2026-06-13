@@ -119,15 +119,86 @@ function despesaKeyValorData(valor: number, date: Date): string {
   return `${valor.toFixed(2)}|${day}`;
 }
 
+// ─── Stage raw transactions into bank_transactions before processing ──────────
+// Upserts each transaction by its Enable Banking transaction_id (dedup key).
+// Returns only the rows that were newly inserted (not already staged + processed).
+async function stageTransactions(
+  transactions: any[],
+  connectionId: string,
+): Promise<{ staged: number; skipped: number }> {
+  let staged = 0;
+  let skipped = 0;
+
+  for (const tx of transactions) {
+    const remittance: string[] = tx.remittance_information ?? tx.remittanceInformation ?? [];
+    const description = remittance.length > 0
+      ? remittance.join(" ")
+      : (tx.creditor?.name ?? tx.debtor?.name ?? tx.creditorName ?? tx.debtorName ?? "");
+    const amountStr = tx.transaction_amount?.amount ?? tx.transactionAmount?.amount ?? "0";
+    const rawAmount = parseFloat(amountStr);
+    const indicator = tx.credit_debit_indicator ?? tx.creditDebitIndicator ?? "";
+    const isDebit = indicator === "DBIT" || rawAmount < 0;
+    // Store as signed: positive = credit, negative = debit
+    const amount = isDebit ? -Math.abs(rawAmount) : Math.abs(rawAmount);
+    const dateStr = tx.booking_date ?? tx.bookingDate ?? tx.value_date ?? tx.valueDate ?? "";
+    const date = dateStr ? new Date(dateStr) : new Date();
+    const txId: string | null = tx.transaction_id ?? tx.transactionId ?? null;
+    const creditorName: string | null = tx.creditor?.name ?? tx.creditorName ?? null;
+    const debtorName: string | null = tx.debtor?.name ?? tx.debtorName ?? null;
+
+    // Skip if already staged by external transaction_id
+    if (txId) {
+      const existing = await db
+        .select({ id: schema.bankTransactions.id, imported: schema.bankTransactions.imported })
+        .from(schema.bankTransactions)
+        .where(eq(schema.bankTransactions.transactionId, txId))
+        .limit(1);
+      if (existing.length > 0) {
+        skipped++;
+        continue;
+      }
+    }
+
+    await db.insert(schema.bankTransactions).values({
+      connectionId,
+      transactionId: txId,
+      amount,
+      currency: tx.transaction_amount?.currency ?? "EUR",
+      date,
+      description,
+      creditorName,
+      debtorName,
+      type: indicator || (isDebit ? "DBIT" : "CRDT"),
+      status: "pending",
+      imported: 0,
+      rawData: JSON.stringify(tx),
+    });
+    staged++;
+  }
+
+  return { staged, skipped };
+}
+
 // ─── Transaction import logic ─────────────────────────────────────────────────
-async function importTransactions(transactions: any[]): Promise<{
+async function importTransactions(transactions: any[], connectionId?: string): Promise<{
   despesasCreated: number;
   quotasCreated: number;
   quotasUpdated: number;
   despesasSkipped: number;
+  staged: number;
+  stagingSkipped: number;
   errors: string[];
 }> {
-  const results = { despesasCreated: 0, quotasCreated: 0, quotasUpdated: 0, despesasSkipped: 0, errors: [] as string[] };
+  // ── STEP 1: Stage all raw transactions first ──────────────────────────────
+  const stagingResult = connectionId
+    ? await stageTransactions(transactions, connectionId)
+    : { staged: 0, skipped: 0 };
+
+  const results = {
+    despesasCreated: 0, quotasCreated: 0, quotasUpdated: 0, despesasSkipped: 0,
+    staged: stagingResult.staged, stagingSkipped: stagingResult.skipped,
+    errors: [] as string[],
+  };
 
   const [allFracoes, existingDespesas, existingQuotas, allQuotaTipos] = await Promise.all([
     db.select().from(schema.fracoes),
@@ -306,10 +377,16 @@ async function importTransactions(transactions: any[]): Promise<{
 
   // Batch writes
   const BATCH = 50;
-  for (let i = 0; i < despesasToInsert.length; i += BATCH)
-    await db.insert(schema.despesas).values(despesasToInsert.slice(i, i + BATCH));
-  for (let i = 0; i < quotasToInsert.length; i += BATCH)
-    await db.insert(schema.quotas).values(quotasToInsert.slice(i, i + BATCH));
+  const insertedDespesaIds: string[] = [];
+  for (let i = 0; i < despesasToInsert.length; i += BATCH) {
+    const inserted = await db.insert(schema.despesas).values(despesasToInsert.slice(i, i + BATCH)).returning({ id: schema.despesas.id });
+    insertedDespesaIds.push(...inserted.map(r => r.id));
+  }
+  const insertedQuotaIds: string[] = [];
+  for (let i = 0; i < quotasToInsert.length; i += BATCH) {
+    const inserted = await db.insert(schema.quotas).values(quotasToInsert.slice(i, i + BATCH)).returning({ id: schema.quotas.id });
+    insertedQuotaIds.push(...inserted.map(r => r.id));
+  }
   for (const q of quotasToUpdate) {
     await db.update(schema.quotas)
       .set({ pago: true, valor: q.valor, dataPagamento: q.data, metodoPagamento: "transferência" })
@@ -319,6 +396,57 @@ async function importTransactions(transactions: any[]): Promise<{
         eq(schema.quotas.ano, q.ano),
         eq(schema.quotas.tipo, q.tipo),
       ));
+  }
+
+  // ── STEP 3: Mark staged transactions as imported=1 ────────────────────────
+  // For each processed transaction, find its staged row by transactionId and update.
+  // We also mark any CRDT entries that were skipped (bank fees, ignored) as imported=1 status=ignored
+  // to prevent them from appearing as "cativos" forever.
+  if (connectionId) {
+    for (const tx of transactions) {
+      const txId: string | null = tx.transaction_id ?? tx.transactionId ?? null;
+      if (!txId) continue;
+      const amountStr = tx.transaction_amount?.amount ?? tx.transactionAmount?.amount ?? "0";
+      const rawAmount = parseFloat(amountStr);
+      const indicator = tx.credit_debit_indicator ?? tx.creditDebitIndicator ?? "";
+      const isDebit = indicator === "DBIT" || rawAmount < 0;
+      const desc = (() => {
+        const r: string[] = tx.remittance_information ?? tx.remittanceInformation ?? [];
+        return r.length > 0 ? r.join(" ") : (tx.creditor?.name ?? tx.debtor?.name ?? "");
+      })();
+
+      // Determine what happened to this tx:
+      let importType: string | null = null;
+      let status = "processed";
+      if (isBankFeeDesc(desc)) {
+        importType = null; status = "ignored";
+      } else if (isDebit) {
+        importType = "despesa";
+      } else {
+        // credit — quota ou ignored
+        const extraTipo = (() => {
+          const upper = desc.toUpperCase();
+          for (const { tipo, kw } of extraTiposByKeyword) {
+            if (upper.includes(kw)) return tipo;
+          }
+          return null;
+        })();
+        if (extraTipo || isMotorGaragemDesc(desc)) {
+          importType = "quota";
+        } else {
+          const descUpper = desc.toUpperCase();
+          const isQuota = descUpper.includes("CONDOM") || descUpper.includes("QUOTA") ||
+            descUpper.includes("FRACAO") || descUpper.includes("FRAÇÃO") ||
+            /\bENTRADA\b/.test(descUpper);
+          importType = isQuota ? "quota" : null;
+          if (!importType) status = "ignored";
+        }
+      }
+
+      await db.update(schema.bankTransactions)
+        .set({ imported: 1, status, importType })
+        .where(eq(schema.bankTransactions.transactionId, txId));
+    }
   }
 
   return results;
@@ -497,9 +625,9 @@ export const bankRoutes = new Hono()
       }
     }
 
-    let importResults = { despesasCreated: 0, quotasCreated: 0, quotasUpdated: 0, despesasSkipped: 0, errors: [] as string[] };
+    let importResults = { despesasCreated: 0, quotasCreated: 0, quotasUpdated: 0, despesasSkipped: 0, staged: 0, stagingSkipped: 0, errors: [] as string[] };
     if (allTransactions.length > 0) {
-      importResults = await importTransactions(allTransactions);
+      importResults = await importTransactions(allTransactions, connection.id);
     }
 
     // Recalcular e persistir saldos em configuracoes após o sync
@@ -581,9 +709,9 @@ export async function runBankSync(): Promise<void> {
     }
   }
 
-  let importResults = { despesasCreated: 0, quotasCreated: 0, quotasUpdated: 0, despesasSkipped: 0, errors: [] as string[] };
+  let importResults = { despesasCreated: 0, quotasCreated: 0, quotasUpdated: 0, despesasSkipped: 0, staged: 0, stagingSkipped: 0, errors: [] as string[] };
   if (allTransactions.length > 0) {
-    importResults = await importTransactions(allTransactions);
+    importResults = await importTransactions(allTransactions, connection.id);
   }
 
   try {

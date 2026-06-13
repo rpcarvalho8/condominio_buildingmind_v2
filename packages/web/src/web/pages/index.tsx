@@ -10,7 +10,8 @@ import {
   TrendingUp, TrendingDown, AlertCircle, CheckCircle2,
   Euro, Building2, RefreshCw, Zap, ChevronRight,
   Flame, Droplets, Wrench, ArrowLeft, Clock, Wallet,
-  ArrowDownCircle, ArrowUpCircle, PiggyBank, DoorOpen
+  ArrowDownCircle, ArrowUpCircle, PiggyBank, DoorOpen,
+  ChevronDown, ChevronUp, Lock, Unlock
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
@@ -92,6 +93,219 @@ export default function DashboardPage() {
 }
 
 // ══════════════════════════════════════════════
+// SALDO OPERACIONAL CARD
+// Mostra saldo físico bancário (conta à ordem) com barra de breakdown:
+//   verde = operacional disponível | segmentos coloridos = cativos por gaveta
+// ══════════════════════════════════════════════
+const GAVETA_COLORS: Record<string, { bar: string; label: string }> = {
+  fundo_reserva: { bar: "#22c55e", label: "Fundo Reserva" },
+  indaqua:       { bar: "#38bdf8", label: "Indaqua" },
+  incendio:      { bar: "#f87171", label: "Incêndio" },
+  portao:        { bar: "#fb923c", label: "Portão" },
+  obras:         { bar: "#fbbf24", label: "Obras" },
+};
+
+function SaldoOperacionalCard({ d }: { d: any }) {
+  const total: number = d.saldoContaCorrenteTotal ?? d.contaCorrente?.saldoConta ?? 0;
+  const operacional: number = d.saldoOperacionalDisponivel ?? total;
+  const cativos = d.valoresCativos ?? {};
+  const cativosTotal: number = cativos.total ?? 0;
+
+  // Build breakdown segments
+  const gavetas = Object.entries(GAVETA_COLORS)
+    .map(([key, meta]) => ({ key, ...meta, value: (cativos[key] ?? 0) as number }))
+    .filter(g => g.value > 0);
+
+  const pct = (v: number) => total > 0 ? Math.max(0.5, (v / total) * 100) : 0;
+
+  return (
+    <div className="rounded-xl border p-5 space-y-4" style={{ background: "var(--bg-surface)", borderColor: "var(--border)" }}>
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-[11px] font-semibold uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>
+            Conta à Ordem — Santander
+          </p>
+          <p className="text-3xl font-mono font-bold tracking-tight mt-0.5" style={{ color: "var(--text-primary)" }}>
+            {formatEuro(total)}
+          </p>
+        </div>
+        <div className="text-right">
+          <div className="flex items-center gap-1.5 justify-end mb-1">
+            <Unlock size={13} style={{ color: "var(--green)" }} />
+            <p className="text-xs font-medium" style={{ color: "var(--text-muted)" }}>Disponível</p>
+          </div>
+          <p className="text-xl font-mono font-bold" style={{ color: "var(--green)" }}>
+            {formatEuro(operacional)}
+          </p>
+          {cativosTotal > 0 && (
+            <div className="flex items-center gap-1.5 justify-end mt-1">
+              <Lock size={11} style={{ color: "var(--amber)" }} />
+              <p className="text-xs font-mono" style={{ color: "var(--amber)" }}>
+                {formatEuro(cativosTotal)} cativos
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Breakdown bar */}
+      <div>
+        <div className="flex h-3 rounded-full overflow-hidden gap-px" style={{ background: "var(--bg-elevated)" }}>
+          {/* Operacional segment */}
+          <div
+            className="rounded-l-full transition-all duration-500"
+            style={{ width: `${pct(operacional)}%`, background: "var(--green)", opacity: 0.85 }}
+          />
+          {/* Cativos segments */}
+          {gavetas.map((g, i) => (
+            <div
+              key={g.key}
+              className={i === gavetas.length - 1 ? "rounded-r-full" : ""}
+              style={{ width: `${pct(g.value)}%`, background: g.bar }}
+            />
+          ))}
+        </div>
+
+        {/* Legend */}
+        <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2">
+          <div className="flex items-center gap-1.5 text-xs" style={{ color: "var(--text-secondary)" }}>
+            <div className="w-2.5 h-2.5 rounded-sm" style={{ background: "var(--green)", opacity: 0.85 }} />
+            Operacional
+          </div>
+          {gavetas.map(g => (
+            <div key={g.key} className="flex items-center gap-1.5 text-xs" style={{ color: "var(--text-secondary)" }}>
+              <div className="w-2.5 h-2.5 rounded-sm" style={{ background: g.bar }} />
+              {g.label} ({formatEuro(g.value)})
+            </div>
+          ))}
+          {gavetas.length === 0 && (
+            <span className="text-xs" style={{ color: "var(--text-muted)" }}>Sem cativos — 100% disponível</span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════
+// CATIVOS ALERT
+// Painel colapsível — só aparece quando há movimentos cativos (imported=0)
+// Lista cada movimento com badge da gaveta, montante e descrição
+// ══════════════════════════════════════════════
+function CativosAlert({ d }: { d: any }) {
+  const [open, setOpen] = useState(false);
+  const cativos = d.valoresCativos ?? {};
+  const movimentos: any[] = cativos.movimentos ?? [];
+  const numMov: number = cativos.numMovimentos ?? 0;
+
+  if (numMov === 0) return null;
+
+  const gavetas = Object.entries(GAVETA_COLORS)
+    .map(([key, meta]) => ({ key, ...meta, value: (cativos[key] ?? 0) as number }))
+    .filter(g => g.value > 0);
+
+  return (
+    <div className="rounded-xl border overflow-hidden" style={{ borderColor: "var(--amber)", background: "rgba(245,158,11,0.06)" }}>
+      {/* Header — sempre visível */}
+      <button
+        className="w-full flex items-center justify-between px-4 py-3 text-left transition-colors"
+        style={{ color: "var(--text-primary)" }}
+        onClick={() => setOpen(o => !o)}
+      >
+        <div className="flex items-center gap-2.5">
+          <Lock size={15} style={{ color: "var(--amber)", flexShrink: 0 }} />
+          <div>
+            <span className="text-sm font-semibold" style={{ color: "var(--amber)" }}>
+              {numMov} movimento{numMov !== 1 ? "s" : ""} a aguardar classificação
+            </span>
+            <span className="text-xs ml-2" style={{ color: "var(--text-muted)" }}>
+              {formatEuro(cativos.total ?? 0)} cativos na conta à ordem
+            </span>
+          </div>
+        </div>
+        {open ? <ChevronUp size={16} style={{ color: "var(--text-muted)" }} /> : <ChevronDown size={16} style={{ color: "var(--text-muted)" }} />}
+      </button>
+
+      {/* Collapsed summary — gavetas com valores */}
+      {!open && (
+        <div className="flex flex-wrap gap-2 px-4 pb-3">
+          {gavetas.map(g => (
+            <span key={g.key} className="text-xs px-2.5 py-1 rounded-full font-medium"
+              style={{ background: `${g.bar}22`, color: g.bar, border: `1px solid ${g.bar}55` }}>
+              {g.label}: {formatEuro(g.value)}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Expanded — lista de movimentos */}
+      {open && (
+        <div className="border-t" style={{ borderColor: "rgba(245,158,11,0.2)" }}>
+          {movimentos.length === 0 ? (
+            <div className="px-4 py-3 space-y-1">
+              {/* Sem detalhe de movimentos — mostrar apenas totais por gaveta */}
+              {gavetas.map(g => (
+                <div key={g.key} className="flex items-center justify-between py-1.5 px-2 rounded-lg"
+                  style={{ background: "var(--bg-elevated)" }}>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs px-2 py-0.5 rounded-full font-medium"
+                      style={{ background: `${g.bar}22`, color: g.bar }}>
+                      {g.label}
+                    </span>
+                  </div>
+                  <span className="text-sm font-mono font-semibold" style={{ color: "var(--text-primary)" }}>
+                    {formatEuro(g.value)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="divide-y" style={{ borderColor: "rgba(245,158,11,0.1)" }}>
+              {movimentos.map((m: any, i: number) => {
+                const gavetaMeta = GAVETA_COLORS[m.gaveta];
+                return (
+                  <div key={i} className="flex items-center justify-between px-4 py-2.5">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <span className="text-xs px-2 py-0.5 rounded-full font-medium shrink-0"
+                        style={{
+                          background: gavetaMeta ? `${gavetaMeta.bar}22` : "var(--bg-elevated)",
+                          color: gavetaMeta?.bar ?? "var(--text-secondary)",
+                          border: `1px solid ${gavetaMeta ? `${gavetaMeta.bar}55` : "var(--border)"}`,
+                        }}>
+                        {gavetaMeta?.label ?? m.gaveta}
+                      </span>
+                      <span className="text-xs truncate" style={{ color: "var(--text-secondary)" }}>
+                        {m.description ?? m.descricao ?? "—"}
+                      </span>
+                    </div>
+                    <span className="text-sm font-mono font-semibold ml-3 shrink-0" style={{ color: "var(--text-primary)" }}>
+                      {formatEuro(Math.abs(m.amount ?? m.montante ?? 0))}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {/* Totais por gaveta (sempre no fundo quando expandido) */}
+          {movimentos.length > 0 && (
+            <div className="px-4 py-3 border-t flex flex-wrap gap-2"
+              style={{ borderColor: "rgba(245,158,11,0.2)", background: "rgba(245,158,11,0.04)" }}>
+              {gavetas.map(g => (
+                <span key={g.key} className="text-xs px-2.5 py-1 rounded-full font-semibold"
+                  style={{ background: `${g.bar}22`, color: g.bar, border: `1px solid ${g.bar}55` }}>
+                  {g.label}: {formatEuro(g.value)}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════
 // OVERVIEW — layout principal
 // ══════════════════════════════════════════════
 function Overview({ d, setSecao, onRefresh }: any) {
@@ -160,6 +374,12 @@ function Overview({ d, setSecao, onRefresh }: any) {
             icon={<CheckCircle2 size={18} />}
             color={taxaCobranca >= 90 ? "green" : taxaCobranca >= 70 ? "amber" : "red"}
           />
+        </div>
+
+        {/* ── 1b. SALDO OPERACIONAL + CATIVOS ───────── */}
+        <div className="space-y-3">
+          <SaldoOperacionalCard d={d} />
+          <CativosAlert d={d} />
         </div>
 
         {/* ── 2. CONTAS ──────────────────────────────── */}
