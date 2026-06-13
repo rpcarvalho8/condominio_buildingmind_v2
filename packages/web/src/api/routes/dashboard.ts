@@ -196,19 +196,27 @@ async function upsertSaldo(chave: string, valor: number): Promise<void> {
  * Recalcula saldos dinâmicos a partir da DB e persiste em `configuracoes`.
  * Deve ser chamado após cada bank sync para que o dashboard reflicta os dados actuais.
  *
- * O que recalcula:
- *  - saldo_conta_corrente: soma de quotas condomínio pagas no ano corrente − despesas YTD
- *    (proxy do saldo bancário real; as transferências do sync actualizam quotas/despesas)
- *  - saldo_fundo_reserva: não temos conta separada na DB → mantém valor manual
- *  - atraso_fundo_reserva: quotas fundo_reserva não pagas
- *  - saldo_obras / a_receber_obras: derivado das quotas obras na DB
- *  - saldo_quota_extra / a_receber_quota_extra: derivado das quotas extras (elevadores)
- *  - portao / incendio: a_receber recalculado (Excel − pagos DB)
+ * Regra de Ouro — gavetas estanques:
+ *  - saldo_conta_corrente : saldoBase + SUM(q.valor WHERE tipo='condominio' AND pago=1 AND dataPagamento>=baseTs)
+ *                           − SUM(d.valor WHERE data>=baseTs)
+ *    ► NUNCA inclui fundoReserva (campo separado), obras, INDAQUA, Incêndio, Portão.
+ *  - saldo_fundo_reserva  : 277.89 (estático — sem conta bancária separada na DB)
+ *  - atraso_fundo_reserva : SUM(q.fundoReserva WHERE tipo='condominio' AND pago=0)
+ *  - a_receber_obras      : SUM(q.valor WHERE tipo='obras' AND pago=0)
+ *  - a_receber_indaqua    : SUM("Em dívida" extraído de observacoes LIKE '%INDAQUA%')
+ *  - a_receber_incendio   : SUM(q.valor WHERE observacoes LIKE '%ncen%' AND pago=0)
+ *  - a_receber_portao     : Excel − pagos DB (quotaTipoId=PORTAO; fallback lista Excel)
+ *  - a_receber_quota_extra: Excel − pagos DB (quotaTipoId=ELEV; fallback lista Excel)
  */
 export async function recalcularSaldos(): Promise<void> {
-  // ── Conta corrente: saldo_base + quotas_pagas_desde_base − despesas_desde_base ──
-  // saldo_base_valor e saldo_base_data são gravados em configuracoes sempre que
-  // o saldo real é confirmado (via Definições ou importação Excel).
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 1. CONTA CORRENTE
+  //    saldoBase + receitas_condominio_desde_ancora − despesas_desde_ancora
+  //    Nota: fundoReserva NÃO entra aqui (gaveta separada).
+  //    Receitas filtradas por data_pagamento (unix ts) >= baseTs.
+  //    Despesas filtradas por data >= baseTs.
+  // ─────────────────────────────────────────────────────────────────────────────
   try {
     const cfgRows = await db.select().from(schema.configuracoes);
     const cfg = Object.fromEntries(cfgRows.map(r => [r.chave, r.valor]));
@@ -218,20 +226,17 @@ export async function recalcularSaldos(): Promise<void> {
     if (saldoBase > 0 && saldoBaseData) {
       const baseTs = Math.floor(new Date(saldoBaseData).getTime() / 1000);
 
-      // Quotas condomínio pagas desde a data base
+      // Apenas q.valor (parte operacional) — fundoReserva fica na sua gaveta
       const quotasDesdeBase = await db
-        .select({ valor: schema.quotas.valor, fundoReserva: schema.quotas.fundoReserva })
+        .select({ valor: schema.quotas.valor })
         .from(schema.quotas)
         .where(and(
           eq(schema.quotas.tipo, "condominio"),
           eq(schema.quotas.pago, true),
           sql`${schema.quotas.dataPagamento} >= ${baseTs}`,
         ));
-      const receitasDesdeBase = quotasDesdeBase.reduce(
-        (s, q) => s + q.valor + (q.fundoReserva ?? 0), 0
-      );
+      const receitasDesdeBase = quotasDesdeBase.reduce((s, q) => s + q.valor, 0);
 
-      // Despesas desde a data base
       const despesasDesdeBase = await db
         .select({ valor: schema.despesas.valor })
         .from(schema.despesas)
@@ -242,98 +247,155 @@ export async function recalcularSaldos(): Promise<void> {
       await upsertSaldo("saldo_conta_corrente", Math.round(saldoCorrente * 100) / 100);
     }
   } catch (e) {
-    // falha silenciosa — saldo_conta_corrente mantém último valor
     console.error("[recalcularSaldos] saldo_conta_corrente:", e);
   }
 
-  // ── Obras: a_receber da DB ──────────────────────────────────────────────────
-  const obrasEmAtraso = await db
-    .select({ valor: schema.quotas.valor })
-    .from(schema.quotas)
-    .where(and(eq(schema.quotas.tipo, "obras"), eq(schema.quotas.pago, false)));
-  const aReceberObrasBD = obrasEmAtraso.reduce((s, q) => s + q.valor, 0);
-
-  const obrasPagas = await db
-    .select({ valor: schema.quotas.valor })
-    .from(schema.quotas)
-    .where(and(eq(schema.quotas.tipo, "obras"), eq(schema.quotas.pago, true)));
-  const pagoObrasBD = obrasPagas.reduce((s, q) => s + q.valor, 0);
-
-  // Só actualiza se a DB tiver dados (evitar apagar valores do Excel antes de importação)
-  if (aReceberObrasBD > 0 || pagoObrasBD > 0) {
-    await upsertSaldo("a_receber_obras", Math.round(aReceberObrasBD * 100) / 100);
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 2. FUNDO DE RESERVA
+  //    Sem conta bancária separada → saldo_fundo_reserva é estático (277.89).
+  //    Só actualizamos atraso_fundo_reserva (quotas condomínio não pagas).
+  // ─────────────────────────────────────────────────────────────────────────────
+  try {
+    const fundoEmAtrasoRows = await db
+      .select({ fundoReserva: schema.quotas.fundoReserva })
+      .from(schema.quotas)
+      .where(and(
+        eq(schema.quotas.tipo, "condominio"),
+        eq(schema.quotas.pago, false),
+      ));
+    const atrasoFundoBD = fundoEmAtrasoRows.reduce((s, q) => s + (q.fundoReserva ?? 0), 0);
+    if (atrasoFundoBD > 0) {
+      await upsertSaldo("atraso_fundo_reserva", Math.round(atrasoFundoBD * 100) / 100);
+    }
+  } catch (e) {
+    console.error("[recalcularSaldos] atraso_fundo_reserva:", e);
   }
 
-  // ── Portão: a_receber = Excel − pagos na DB ─────────────────────────────────
-  const portaoPagosRows = await db
-    .select({ numero: schema.fracoes.numero })
-    .from(schema.quotas)
-    .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
-    .where(and(
-      eq(schema.quotas.tipo, "extra"),
-      eq(schema.quotas.quotaTipoId, PORTAO_TIPO_ID),
-      eq(schema.quotas.pago, true),
-    ));
-  const portaoPagosNums = new Set(portaoPagosRows.map(r => r.numero).filter(Boolean));
-  const portaoMorosos = PORTAO_DEVEDORES_EXCEL.filter(d => !portaoPagosNums.has(d.fracao.numero));
-  const aReceberPortao = Math.round(portaoMorosos.reduce((s, d) => s + d.total, 0) * 100) / 100;
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 3. OBRAS
+  //    Gaveta separada — não afecta conta corrente.
+  // ─────────────────────────────────────────────────────────────────────────────
+  try {
+    const obrasEmAtraso = await db
+      .select({ valor: schema.quotas.valor })
+      .from(schema.quotas)
+      .where(and(eq(schema.quotas.tipo, "obras"), eq(schema.quotas.pago, false)));
+    const aReceberObrasBD = obrasEmAtraso.reduce((s, q) => s + q.valor, 0);
 
-  const portaoPagosValor = await db
-    .select({ valor: schema.quotas.valor })
-    .from(schema.quotas)
-    .where(and(
-      eq(schema.quotas.tipo, "extra"),
-      eq(schema.quotas.quotaTipoId, PORTAO_TIPO_ID),
-      eq(schema.quotas.pago, true),
-    ));
-  const pagoPortao = Math.round(portaoPagosValor.reduce((s, q) => s + q.valor, 0) * 100) / 100;
+    const obrasPagas = await db
+      .select({ valor: schema.quotas.valor })
+      .from(schema.quotas)
+      .where(and(eq(schema.quotas.tipo, "obras"), eq(schema.quotas.pago, true)));
+    const pagoObrasBD = obrasPagas.reduce((s, q) => s + q.valor, 0);
 
-  await upsertSaldo("a_receber_portao", aReceberPortao);
-  if (pagoPortao > 0) await upsertSaldo("portao_pago", pagoPortao);
+    if (aReceberObrasBD > 0 || pagoObrasBD > 0) {
+      await upsertSaldo("a_receber_obras", Math.round(aReceberObrasBD * 100) / 100);
+    }
+  } catch (e) {
+    console.error("[recalcularSaldos] obras:", e);
+  }
 
-  // ── Quota extra (elevadores): a_receber = Excel − pagos na DB ───────────────
-  const elevPagosRows = await db
-    .select({ numero: schema.fracoes.numero })
-    .from(schema.quotas)
-    .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
-    .where(and(
-      eq(schema.quotas.tipo, "extra"),
-      eq(schema.quotas.quotaTipoId, ELEV_TIPO_ID),
-      eq(schema.quotas.pago, true),
-    ));
-  const elevPagosNums = new Set(elevPagosRows.map(r => r.numero).filter(Boolean));
-  const elevMorosos = QUOTA_EXTRA_DEVEDORES_EXCEL.filter(d => !elevPagosNums.has(d.fracao.numero));
-  const aReceberElev = Math.round(elevMorosos.reduce((s, d) => s + d.total, 0) * 100) / 100;
-  await upsertSaldo("a_receber_quota_extra", aReceberElev);
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 4. INDAQUA (Quota Extra Elevadores)
+  //    quotaTipoId está NULL na DB (importado sem tipo ligado).
+  //    Identificação via observacoes LIKE '%INDAQUA%'.
+  //    O campo `valor` contém o total histórico da fraccão, NÃO a dívida actual.
+  //    A dívida real está na string "Em dívida: X€" dentro de observacoes.
+  //    Extraímos esse valor em JS para calcular a_receber_indaqua.
+  // ─────────────────────────────────────────────────────────────────────────────
+  try {
+    const indaquaRows = await db
+      .select({ valor: schema.quotas.valor, pago: schema.quotas.pago, observacoes: schema.quotas.observacoes })
+      .from(schema.quotas)
+      .where(sql`${schema.quotas.observacoes} LIKE '%INDAQUA%'`);
 
-  // ── Incêndio: a_receber = Excel − pagos na DB ───────────────────────────────
-  const incPagosRows = await db
-    .select({ numero: schema.fracoes.numero })
-    .from(schema.quotas)
-    .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
-    .where(and(
-      eq(schema.quotas.tipo, "extra"),
-      eq(schema.quotas.quotaTipoId, INCENDIO_TIPO_ID),
-      eq(schema.quotas.pago, true),
-    ));
-  const incPagosNums = new Set(incPagosRows.map(r => r.numero).filter(Boolean));
-  const incMorosos = INCENDIO_DEVEDORES_EXCEL.filter(d => !incPagosNums.has(d.fracao.numero));
-  const aReceberInc = Math.round(incMorosos.reduce((s, d) => s + d.total, 0) * 100) / 100;
-  await upsertSaldo("a_receber_incendio", aReceberInc);
+    // Para quotas não pagas, extrair "Em dívida: X€" das observacoes (fonte de verdade)
+    // Para quotas pagas, valor=0 (já liquidadas)
+    const aReceberIndaqua = indaquaRows.reduce((s, q) => {
+      if (q.pago) return s;
+      const m = q.observacoes?.match(/Em d[ií]vida: ([\d.]+)€/);
+      return s + (m ? parseFloat(m[1]) : q.valor);
+    }, 0);
 
-  // ── Fundo reserva: atraso calculado da DB ───────────────────────────────────
-  // O fundo de reserva está no campo `fundoReserva` (real) das quotas tipo="condominio",
-  // não em linhas separadas com tipo="fundo_reserva". A query anterior (LIKE 'fundo%') nunca retornava nada.
-  const fundoEmAtrasoRows = await db
-    .select({ fundoReserva: schema.quotas.fundoReserva })
-    .from(schema.quotas)
-    .where(and(
-      eq(schema.quotas.tipo, "condominio"),
-      eq(schema.quotas.pago, false),
-    ));
-  const atrasoFundoBD = fundoEmAtrasoRows.reduce((s, q) => s + (q.fundoReserva ?? 0), 0);
-  if (atrasoFundoBD > 0) {
-    await upsertSaldo("atraso_fundo_reserva", Math.round(atrasoFundoBD * 100) / 100);
+    await upsertSaldo("a_receber_indaqua", Math.round(aReceberIndaqua * 100) / 100);
+  } catch (e) {
+    console.error("[recalcularSaldos] indaqua:", e);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 5. INCÊNDIO (Obras Incêndio)
+  //    quotaTipoId NULL — identificação via observacoes LIKE '%ncen%'.
+  //    Campo valor = dívida da fraccão (todas pago=0 → soma directa).
+  // ─────────────────────────────────────────────────────────────────────────────
+  try {
+    const incendioRows = await db
+      .select({ valor: schema.quotas.valor })
+      .from(schema.quotas)
+      .where(and(
+        sql`${schema.quotas.observacoes} LIKE '%ncen%'`,
+        eq(schema.quotas.pago, false),
+      ));
+    const aReceberIncendio = incendioRows.reduce((s, q) => s + q.valor, 0);
+    await upsertSaldo("a_receber_incendio", Math.round(aReceberIncendio * 100) / 100);
+  } catch (e) {
+    console.error("[recalcularSaldos] incendio:", e);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 6. PORTÃO GARAGEM
+  //    Tenta quotaTipoId (quota_tipos pode estar vazia). Se não houver registos,
+  //    cai no fallback Excel (PORTAO_DEVEDORES_EXCEL).
+  // ─────────────────────────────────────────────────────────────────────────────
+  try {
+    const portaoPagosRows = await db
+      .select({ numero: schema.fracoes.numero })
+      .from(schema.quotas)
+      .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
+      .where(and(
+        eq(schema.quotas.tipo, "extra"),
+        eq(schema.quotas.quotaTipoId, PORTAO_TIPO_ID),
+        eq(schema.quotas.pago, true),
+      ));
+    const portaoPagosNums = new Set(portaoPagosRows.map(r => r.numero).filter(Boolean));
+    const portaoMorosos = PORTAO_DEVEDORES_EXCEL.filter(d => !portaoPagosNums.has(d.fracao.numero));
+    const aReceberPortao = Math.round(portaoMorosos.reduce((s, d) => s + d.total, 0) * 100) / 100;
+
+    const portaoPagosValor = await db
+      .select({ valor: schema.quotas.valor })
+      .from(schema.quotas)
+      .where(and(
+        eq(schema.quotas.tipo, "extra"),
+        eq(schema.quotas.quotaTipoId, PORTAO_TIPO_ID),
+        eq(schema.quotas.pago, true),
+      ));
+    const pagoPortao = Math.round(portaoPagosValor.reduce((s, q) => s + q.valor, 0) * 100) / 100;
+
+    await upsertSaldo("a_receber_portao", aReceberPortao);
+    if (pagoPortao > 0) await upsertSaldo("portao_pago", pagoPortao);
+  } catch (e) {
+    console.error("[recalcularSaldos] portao:", e);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 7. QUOTA EXTRA ELEVADORES (ELEV_TIPO_ID)
+  //    Mesmo padrão do portão — quotaTipoId ou fallback Excel.
+  // ─────────────────────────────────────────────────────────────────────────────
+  try {
+    const elevPagosRows = await db
+      .select({ numero: schema.fracoes.numero })
+      .from(schema.quotas)
+      .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
+      .where(and(
+        eq(schema.quotas.tipo, "extra"),
+        eq(schema.quotas.quotaTipoId, ELEV_TIPO_ID),
+        eq(schema.quotas.pago, true),
+      ));
+    const elevPagosNums = new Set(elevPagosRows.map(r => r.numero).filter(Boolean));
+    const elevMorosos = QUOTA_EXTRA_DEVEDORES_EXCEL.filter(d => !elevPagosNums.has(d.fracao.numero));
+    const aReceberElev = Math.round(elevMorosos.reduce((s, d) => s + d.total, 0) * 100) / 100;
+    await upsertSaldo("a_receber_quota_extra", aReceberElev);
+  } catch (e) {
+    console.error("[recalcularSaldos] quota_extra:", e);
   }
 }
 
