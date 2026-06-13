@@ -13,7 +13,9 @@
     "db:generate": "bun --env-file=../../.env drizzle-kit generate",
     "db:migrate": "bun --env-file=../../.env drizzle-kit migrate",
     "db:push": "bun --env-file=../../.env drizzle-kit push",
-    "db:studio": "bun --env-file=../../.env drizzle-kit studio"
+    "db:studio": "bun --env-file=../../.env drizzle-kit studio",
+    "import:excel-2026": "bun run scripts/import-excel-2026.ts",
+    "db:setup-local": "bun run scripts/setup-local-db.ts"
   },
   "dependencies": {
     "@libsql/client": "^0.17.2",
