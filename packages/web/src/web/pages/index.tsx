@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
+import { useBankSync } from "../hooks/useBankSync";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/Layout";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/Card";
@@ -33,9 +34,56 @@ type Secao = "overview" | "contaCorrente" | "obras" | "incendio" | "quotaExtra" 
 // ──────────────────────────────────────────────
 // Root
 // ──────────────────────────────────────────────
+// ──────────────────────────────────────────────
+// SyncBanner — barra discreta no topo
+// ──────────────────────────────────────────────
+function SyncBanner({ isSyncing, syncError, syncDone }: { isSyncing: boolean; syncError: string | null; syncDone: boolean }) {
+  if (!isSyncing && !syncError && !syncDone) return null;
+
+  if (isSyncing) {
+    return (
+      <div className="flex items-center gap-2.5 px-4 py-2 text-xs"
+        style={{ background: "rgba(59,130,246,0.08)", borderBottom: "1px solid rgba(59,130,246,0.2)", color: "var(--blue-bright)" }}>
+        <svg className="animate-spin h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+        </svg>
+        <span>A sincronizar movimentos bancários Santander…</span>
+      </div>
+    );
+  }
+
+  if (syncError) {
+    return (
+      <div className="flex items-center gap-2.5 px-4 py-2 text-xs"
+        style={{ background: "rgba(245,158,11,0.08)", borderBottom: "1px solid rgba(245,158,11,0.25)", color: "var(--amber)" }}>
+        <svg className="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+        </svg>
+        <span>Sync bancário: {syncError}</span>
+      </div>
+    );
+  }
+
+  if (syncDone) {
+    return (
+      <div className="flex items-center gap-2.5 px-4 py-2 text-xs"
+        style={{ background: "rgba(34,197,94,0.07)", borderBottom: "1px solid rgba(34,197,94,0.2)", color: "var(--green)" }}>
+        <svg className="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+        </svg>
+        <span>Movimentos bancários sincronizados</span>
+      </div>
+    );
+  }
+
+  return null;
+}
+
 export default function DashboardPage() {
   const qc = useQueryClient();
   const [secao, setSecao] = useState<Secao>("overview");
+  const { isSyncing, syncError, syncDone } = useBankSync();
 
   const { data, isLoading } = useQuery({
     queryKey: ["dashboard"],
@@ -49,13 +97,16 @@ export default function DashboardPage() {
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-full" style={{ color: "var(--text-muted)" }}>
-        <div className="flex items-center gap-3">
-          <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24" fill="none">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-          </svg>
-          <span className="text-sm">A carregar…</span>
+      <div className="flex flex-col h-full">
+        <SyncBanner isSyncing={isSyncing} syncError={syncError} syncDone={syncDone} />
+        <div className="flex items-center justify-center flex-1" style={{ color: "var(--text-muted)" }}>
+          <div className="flex items-center gap-3">
+            <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24" fill="none">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+            </svg>
+            <span className="text-sm">A carregar…</span>
+          </div>
         </div>
       </div>
     );
@@ -66,6 +117,7 @@ export default function DashboardPage() {
   if (!d || d.totalFracoes === 0) {
     return (
       <>
+        <SyncBanner isSyncing={isSyncing} syncError={syncError} syncDone={syncDone} />
         <PageHeader title="Dashboard" subtitle="Urbanização da Fonte" />
         <div className="flex flex-col items-center justify-center h-96 gap-4">
           <Building2 size={48} style={{ color: "var(--text-muted)" }} />
@@ -80,16 +132,22 @@ export default function DashboardPage() {
   }
 
   // Secções de detalhe
-  if (secao === "contaCorrente") return <SecaoContaCorrente data={d} onBack={() => setSecao("overview")} />;
-  if (secao === "obras") return <SecaoObras data={d} onBack={() => setSecao("overview")} />;
-  if (secao === "incendio") return <SecaoIncendio data={d} onBack={() => setSecao("overview")} />;
-  if (secao === "quotaExtra") return <SecaoQuotaExtra data={d} onBack={() => setSecao("overview")} />;
-  if (secao === "portaoGaragem") return <SecaoPortaoGaragem data={d} onBack={() => setSecao("overview")} />;
-  if (secao === "fundoReserva") return <SecaoFundoReserva data={d} onBack={() => setSecao("overview")} />;
+  const syncBannerEl = <SyncBanner isSyncing={isSyncing} syncError={syncError} syncDone={syncDone} />;
+  if (secao === "contaCorrente") return <>{syncBannerEl}<SecaoContaCorrente data={d} onBack={() => setSecao("overview")} /></>;
+  if (secao === "obras") return <>{syncBannerEl}<SecaoObras data={d} onBack={() => setSecao("overview")} /></>;
+  if (secao === "incendio") return <>{syncBannerEl}<SecaoIncendio data={d} onBack={() => setSecao("overview")} /></>;
+  if (secao === "quotaExtra") return <>{syncBannerEl}<SecaoQuotaExtra data={d} onBack={() => setSecao("overview")} /></>;
+  if (secao === "portaoGaragem") return <>{syncBannerEl}<SecaoPortaoGaragem data={d} onBack={() => setSecao("overview")} /></>;
+  if (secao === "fundoReserva") return <>{syncBannerEl}<SecaoFundoReserva data={d} onBack={() => setSecao("overview")} /></>;
   const extraSel = d.extras?.find((e: any) => e.tipo.id === secao);
-  if (extraSel) return <SecaoExtra extra={extraSel} incendioData={d.incendio} onBack={() => setSecao("overview")} />;
+  if (extraSel) return <>{syncBannerEl}<SecaoExtra extra={extraSel} incendioData={d.incendio} onBack={() => setSecao("overview")} /></>;
 
-  return <Overview d={d} setSecao={setSecao} onRefresh={() => qc.invalidateQueries({ queryKey: ["dashboard"] })} />;
+  return (
+    <>
+      <SyncBanner isSyncing={isSyncing} syncError={syncError} syncDone={syncDone} />
+      <Overview d={d} setSecao={setSecao} onRefresh={() => qc.invalidateQueries({ queryKey: ["dashboard"] })} />
+    </>
+  );
 }
 
 // ══════════════════════════════════════════════
