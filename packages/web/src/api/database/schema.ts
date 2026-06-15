@@ -178,6 +178,7 @@ export const bankTransactions = sqliteTable("bank_transactions", {
   imported: integer("imported").default(0),      // 0=não processado, 1=importado
   importType: text("import_type"),               // "quota" | "despesa" | "cativo"
   importRefId: text("import_ref_id"),            // ID da quota/despesa criada
+  requiresManualReview: integer("requires_manual_review").default(0), // 1=motor devolveu null, revisão manual
   rawData: text("raw_data"),                     // JSON raw do Enable Banking
   createdAt: integer("created_at", { mode: "timestamp" })
     .notNull()

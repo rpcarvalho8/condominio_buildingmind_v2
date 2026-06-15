@@ -519,6 +519,175 @@ async function importTransactions(transactions: any[], connectionId?: string): P
   return results;
 }
 
+// ─── Process Staged Transactions ─────────────────────────────────────────────
+// Lê todas as bank_transactions com imported=0, corre o motor matricial
+// e a cascata de amortização, e atualiza flags.
+// Retorna sumário do processamento.
+export async function processarStagedTransactions(): Promise<{
+  processed: number;
+  manualReview: number;
+  errors: string[];
+  details: Array<{ transactionId: string; result: "processed" | "manual_review" | "error"; fracao?: string; score?: number; motivo?: string }>;
+}> {
+  const summary = {
+    processed: 0,
+    manualReview: 0,
+    errors: [] as string[],
+    details: [] as Array<{ transactionId: string; result: "processed" | "manual_review" | "error"; fracao?: string; score?: number; motivo?: string }>,
+  };
+
+  // Buscar todas as TXNs pendentes (imported=0)
+  const pendentes = await db
+    .select()
+    .from(schema.bankTransactions)
+    .where(eq(schema.bankTransactions.imported, 0));
+
+  if (pendentes.length === 0) return summary;
+
+  // Carregar frações uma vez
+  const allFracoes = await db.select().from(schema.fracoes);
+  const fracaoByNum = new Map(allFracoes.map(f => [f.numero.toUpperCase(), f]));
+
+  for (const txn of pendentes) {
+    const txId = txn.transactionId ?? txn.id;
+    try {
+      // Só processamos créditos (entradas) — débitos já processados via importTransactions
+      if (txn.type === "DBIT" || (txn.amount ?? 0) < 0) {
+        // Débito sem connectionId: marcar como processed/ignored sem cascata
+        await db.update(schema.bankTransactions)
+          .set({ imported: 1, status: "ignored", importType: "despesa" })
+          .where(eq(schema.bankTransactions.id, txn.id));
+        summary.details.push({ transactionId: txId, result: "processed", motivo: "débito ignorado no process-staged" });
+        summary.processed++;
+        continue;
+      }
+
+      // Extrair IBAN do rawData — suporta tanto o formato Enable Banking real
+      // como o formato simplificado dos seeds QA: { iban_sender: "PTxx..." }
+      const ibanSender: string | undefined = txn.rawData
+        ? (() => {
+            try {
+              const d = JSON.parse(txn.rawData);
+              return d.iban_sender            // formato QA seed / simplificado
+                ?? d.debtor?.account?.iban    // Enable Banking real
+                ?? d.debtorIban              // camelCase legacy
+                ?? undefined;
+            } catch { return undefined; }
+          })()
+        : undefined;
+
+      const matrixResult = await identifyByMultiMatch({
+        descricao: txn.description ?? "",
+        amount: Math.abs(txn.amount ?? 0),
+        ibanSender,
+        debtorName: txn.debtorName ?? undefined,
+      });
+
+      if (!matrixResult || matrixResult.confidence < 55) {
+        // Motor não conseguiu identificar — requires_manual_review
+        await db.update(schema.bankTransactions)
+          .set({ requiresManualReview: 1, status: "pending" })
+          .where(eq(schema.bankTransactions.id, txn.id));
+        summary.manualReview++;
+        summary.details.push({
+          transactionId: txId,
+          result: "manual_review",
+          score: matrixResult?.confidence ?? 0,
+          motivo: matrixResult ? `score ${matrixResult.confidence} < 55 ou < 2 critérios` : "nenhum match",
+        });
+        continue;
+      }
+
+      // Motor identificou — fração confirmada
+      const fracaoDB = fracaoByNum.get(matrixResult.fracao.idFracao.toUpperCase());
+      if (!fracaoDB) {
+        throw new Error(`Fração ${matrixResult.fracao.idFracao} não encontrada na BD`);
+      }
+
+      const txDate = txn.date instanceof Date ? txn.date : new Date((txn.date as number) * 1000);
+      const mes = txDate.getMonth() + 1;
+      const ano = txDate.getFullYear();
+      const valor = Math.abs(txn.amount ?? 0);
+
+      // Verificar dedup — não criar quota duplicada
+      const existingQuota = await db.select({ id: schema.quotas.id })
+        .from(schema.quotas)
+        .where(and(
+          eq(schema.quotas.fracaoId, fracaoDB.id),
+          eq(schema.quotas.mes, mes),
+          eq(schema.quotas.ano, ano),
+          eq(schema.quotas.tipo, "condominio"),
+        ))
+        .limit(1);
+
+      let quotaId: string;
+      if (existingQuota.length > 0) {
+        // Atualizar quota existente para pago=true
+        await db.update(schema.quotas)
+          .set({ pago: true, valor, dataPagamento: txDate, metodoPagamento: "transferência",
+                 observacoes: `[process-staged motor:${matrixResult.confidence}% criterios:${matrixResult.criterios.join("+")}]` })
+          .where(eq(schema.quotas.id, existingQuota[0].id));
+        quotaId = existingQuota[0].id;
+      } else {
+        // Inserir nova quota
+        const inserted = await db.insert(schema.quotas).values({
+          fracaoId: fracaoDB.id,
+          tipo: "condominio",
+          mes, ano, valor,
+          fundoReserva: parseFloat((valor * 0.1).toFixed(2)),
+          pago: true,
+          dataPagamento: txDate,
+          metodoPagamento: "transferência",
+          observacoes: `[process-staged motor:${matrixResult.confidence}% criterios:${matrixResult.criterios.join("+")}]${matrixResult.ibanNovoAprendido ? " [IBAN aprendido]" : ""}`,
+        }).returning({ id: schema.quotas.id });
+        quotaId = inserted[0].id;
+      }
+
+      // Cascata de amortização
+      await processarCascataAmortizacao(
+        matrixResult.fracao.idFracao,
+        valor,
+        fracaoDB.id,
+        mes,
+        ano,
+      );
+
+      // Marcar TXN como imported=1
+      await db.update(schema.bankTransactions)
+        .set({
+          imported: 1,
+          status: "processed",
+          importType: "quota",
+          importRefId: quotaId,
+          requiresManualReview: 0,
+        })
+        .where(eq(schema.bankTransactions.id, txn.id));
+
+      summary.processed++;
+      summary.details.push({
+        transactionId: txId,
+        result: "processed",
+        fracao: matrixResult.fracao.idFracao,
+        score: matrixResult.confidence,
+        motivo: `criterios: ${matrixResult.criterios.join("+")}`,
+      });
+
+    } catch (e: any) {
+      summary.errors.push(`[${txId}] ${e.message}`);
+      summary.details.push({ transactionId: txId, result: "error", motivo: e.message });
+    }
+  }
+
+  // Recalcular saldos após processar staged
+  try {
+    await recalcularSaldos();
+  } catch (e: any) {
+    summary.errors.push(`[recalcularSaldos] ${e.message}`);
+  }
+
+  return summary;
+}
+
 // ─── Routes ───────────────────────────────────────────────────────────────────
 export const bankRoutes = new Hono()
 
@@ -706,6 +875,21 @@ export const bankRoutes = new Hono()
       importResults.errors.push(`recalcularSaldos: ${e.message}`);
     }
 
+    // ── Varrer staging: processar TXNs que ficaram imported=0 ────────────────
+    // Inclui TXNs injectadas manualmente ou que falharam durante o sync
+    try {
+      const stagedResult = await processarStagedTransactions();
+      if (stagedResult.processed > 0 || stagedResult.manualReview > 0) {
+        console.log(`[bank/sync] process-staged: ${stagedResult.processed} processadas, ${stagedResult.manualReview} para revisão manual`);
+      }
+      if (stagedResult.errors.length > 0) {
+        importResults.errors.push(...stagedResult.errors.map(e => `[staged] ${e}`));
+      }
+    } catch (e: any) {
+      console.error("[bank/sync] Erro ao processar staged:", e.message);
+      importResults.errors.push(`[staged] ${e.message}`);
+    }
+
     // Log the sync
     await db.insert(schema.bankSyncLogs).values({
       connectionId: connection.id,
@@ -733,6 +917,25 @@ export const bankRoutes = new Hono()
   .delete("/disconnect", requireAdmin, async (c) => {
     await db.delete(schema.bankConnections);
     return c.json({ ok: true });
+  })
+
+  // POST /api/bank/process-staged — processar TXNs em staging (imported=0)
+  // Corre o motor matricial em todas as transações pendentes e aplica a cascata.
+  // TXNs identificadas com score >= 55 → imported=1 + quota criada/atualizada
+  // TXNs sem match → requires_manual_review=1, imported permanece 0
+  .post("/process-staged", requireAdmin, async (c) => {
+    try {
+      const result = await processarStagedTransactions();
+      return c.json({
+        ok: true,
+        processed: result.processed,
+        manualReview: result.manualReview,
+        errors: result.errors,
+        details: result.details,
+      });
+    } catch (e: any) {
+      return c.json({ ok: false, error: e.message }, 500);
+    }
   })
 
   // GET /api/bank/synclogs — last 10 sync logs
