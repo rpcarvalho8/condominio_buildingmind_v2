@@ -160,10 +160,10 @@ const FUNDO_RESERVA_DEVEDORES_EXCEL = [
 //   atraso_fundo_reserva: 28.41 Excel → corrigido: 28.41 - 23.99 (L pré-2026 fundo) + 2.79 (L Jan fundo resto) = 7.21
 const SALDO_DEFAULTS: Record<string, number> = {
   saldo_conta_corrente: 3388.39, // saldo base confirmado 2026-06-13
-  saldo_fundo_reserva: 277.89,
+  saldo_fundo_reserva: 651.30,   // soma real depósitos a prazo FR: 250+83.58+104.60+85.23+127.89
   atraso_fundo_reserva: 7.21,  // corrigido: L pagou 25.47 (23.99 pre-2026 fundo + parcial Jan)
-  saldo_obras: 26912.37,
-  saldo_quota_extra: 4140.79,
+  saldo_obras: 21185.29,        // soma real 16 depósitos a prazo Obras (extrato Santander)
+  saldo_quota_extra: 110.45,    // depósito a prazo "Quota Extra" real (extrato Santander)
   saldo_incendio: 0,
   a_receber_incendio: 157.98,
   a_receber_obras: 6006.05,
@@ -483,13 +483,11 @@ export async function recalcularSaldos(): Promise<void> {
       await upsertSaldo("a_receber_obras", Math.round(aReceberObrasBD * 100) / 100);
     }
 
-    // Saldo virtual obras += cativos identificados como obras
-    if (cativos.obras > 0) {
-      const saldoObrasVirtual = Math.round(
-        (SALDO_DEFAULTS.saldo_obras + cativos.obras) * 100
-      ) / 100;
-      await upsertSaldo("saldo_obras", saldoObrasVirtual);
-    }
+    // Saldo virtual obras = base real (depósitos a prazo) + cativos ainda na Conta à Ordem
+    const saldoObrasVirtual = Math.round(
+      (SALDO_DEFAULTS.saldo_obras + cativos.obras) * 100
+    ) / 100;
+    await upsertSaldo("saldo_obras", saldoObrasVirtual);
   } catch (e) {
     console.error("[recalcularSaldos] obras:", e);
   }
@@ -514,12 +512,11 @@ export async function recalcularSaldos(): Promise<void> {
     await upsertSaldo("a_receber_indaqua", Math.round(aReceberIndaqua * 100) / 100);
 
     // Saldo virtual INDAQUA += cativos ainda na Conta à Ordem
-    if (cativos.indaqua > 0) {
-      const saldoIndaquaVirtual = Math.round(
-        (SALDO_DEFAULTS.saldo_quota_extra + cativos.indaqua) * 100
-      ) / 100;
-      await upsertSaldo("saldo_quota_extra", saldoIndaquaVirtual);
-    }
+    // Saldo virtual INDAQUA = base real (depósito a prazo) + cativos ainda na Conta à Ordem
+    const saldoIndaquaVirtual = Math.round(
+      (SALDO_DEFAULTS.saldo_quota_extra + cativos.indaqua) * 100
+    ) / 100;
+    await upsertSaldo("saldo_quota_extra", saldoIndaquaVirtual);
   } catch (e) {
     console.error("[recalcularSaldos] indaqua:", e);
   }
@@ -628,7 +625,7 @@ export const dashboard = new Hono()
       .select({ totalFracoes: sql<number>`count(*)` })
       .from(schema.fracoes)
       .where(eq(schema.fracoes.ativo, true));
-    const totalFracoes = fracaoCountRows[0]?.totalFracoes ?? 0;
+    const totalFracoes = Math.max(fracaoCountRows[0]?.totalFracoes ?? 0, 33);
 
     // Quotas do mês atual (condomínio + fundo reserva)
     const quotasMes = await db
