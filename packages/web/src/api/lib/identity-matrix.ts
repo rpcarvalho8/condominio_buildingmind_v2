@@ -667,18 +667,125 @@ function valorCoincideExtra(amount: number, fracao: FracaoIdentidade): boolean {
   return false;
 }
 
+// ─── Helpers de desempate IBAN ────────────────────────────────────────────────
+
+/**
+ * Score de desempate: nome do remetente vs proprietário (+35).
+ * Usa a mesma lógica de tokens que nomeCoincide(), mas devolve pontos em vez de bool.
+ */
+function scoreDesempateNome(debtorName: string | undefined, nomeProprietario: string): number {
+  if (!debtorName) return 0;
+  return nomeCoincide(debtorName, nomeProprietario) ? 35 : 0;
+}
+
+/**
+ * Score de desempate: descrição contém "Entrada NN Fracção X" ou "ENTRADA NN FR X" (+30).
+ * Exemplo: "ENTRADA 39 AF" ou "Entrada 39 Fracção AF".
+ */
+function scoreDesempateEntradaFracao(
+  descricao: string | undefined,
+  entrada: string,
+  idFracao: string,
+): number {
+  if (!descricao) return 0;
+  const d = normStr(descricao);
+  const id = idFracao.toUpperCase();
+  // Extrair número da entrada, ex: "ENTRADA 39" → "39"
+  const entradaNum = entrada.replace(/\D/g, "");
+  if (!entradaNum) return 0;
+  // "ENTRADA 39 AF" ou "ENTRADA 39 FRACAO AF" ou "ENTRADA 39 FRACCAO AF"
+  const re = new RegExp(`ENTRADA\\s+${entradaNum}\\s+(FRACAO\\s+|FRACCAO\\s+|FR\\s+)?${id}\\b`);
+  return re.test(d) ? 30 : 0;
+}
+
+/**
+ * Score de desempate: descrição contém "Entrada NN" + texto da descrição da fração (+25).
+ * Exemplo: "ENTRADA 39 2B GAR 12" vs descricao="2B + GAR 12".
+ */
+function scoreDesempateEntradaDescricao(
+  descricao: string | undefined,
+  entrada: string,
+  descFracao: string,
+): number {
+  if (!descricao) return 0;
+  const d = normStr(descricao);
+  const entradaNum = entrada.replace(/\D/g, "");
+  const descNorm = normStr(descFracao);
+  if (!entradaNum) return 0;
+  // Verificar que a descrição menciona o número de entrada
+  if (!d.includes(entradaNum)) return 0;
+  // Verificar que pelo menos 2 tokens da descricao da fração aparecem na descrição
+  const tokens = descNorm.split(" ").filter((t) => t.length > 1);
+  const matched = tokens.filter((t) => d.includes(t));
+  return matched.length >= 2 ? 25 : 0;
+}
+
+/**
+ * Score de desempate: descrição contém texto da descrição da fração isolada (+20).
+ * Exemplo: "LUGAR GAR. 11" ou "2B + GAR 12" na descrição da TXN.
+ */
+function scoreDesempateDescricaoIsolada(
+  descricao: string | undefined,
+  descFracao: string,
+): number {
+  if (!descricao) return 0;
+  const d = normStr(descricao);
+  const descNorm = normStr(descFracao);
+  const tokens = descNorm.split(" ").filter((t) => t.length > 1);
+  if (tokens.length === 0) return 0;
+  const matched = tokens.filter((t) => d.includes(t));
+  // Exige todos os tokens (ou ≥2 se muitos)
+  const minMatch = tokens.length <= 2 ? tokens.length : Math.ceil(tokens.length * 0.7);
+  return matched.length >= minMatch ? 20 : 0;
+}
+
+/**
+ * Calcula score de desempate para uma fração colidida (quando IBAN → múltiplas frações).
+ * Sub-critérios: nome(+35), entrada+fração(+30), entrada+desc(+25), desc isolada(+20).
+ * Retorna { score, criterios }.
+ */
+function calcularScoreDesempate(
+  input: MatchInput,
+  fracao: FracaoIdentidade,
+): { score: number; criterios: MatchCriterio[] } {
+  let score = 0;
+  const criterios: MatchCriterio[] = [];
+
+  const sNome = scoreDesempateNome(input.debtorName, fracao.nomeProprietario);
+  if (sNome > 0) { score += sNome; criterios.push("nome"); }
+
+  const sEntFrac = scoreDesempateEntradaFracao(input.descricao, fracao.entrada, fracao.idFracao);
+  if (sEntFrac > 0) { score += sEntFrac; criterios.push("descricao_fracao"); }
+
+  const sEntDesc = scoreDesempateEntradaDescricao(input.descricao, fracao.entrada, fracao.descricao);
+  if (sEntDesc > 0 && !criterios.includes("descricao_fracao")) {
+    score += sEntDesc; criterios.push("descricao_fracao");
+  } else if (sEntDesc > 0) {
+    score += sEntDesc; // soma mesmo que criterio já contado (pontuação adicional)
+  }
+
+  const sDesc = scoreDesempateDescricaoIsolada(input.descricao, fracao.descricao);
+  if (sDesc > 0 && criterios.length < 3) { score += sDesc; criterios.push("descricao_fracao"); }
+
+  return { score, criterios };
+}
+
 /**
  * Identifica a fração a partir de ≥2 critérios de matching.
  * Se identificação for bem sucedida E o IBAN for novo → chama learnIBAN().
  *
  * Hierarquia de confiança:
  *   iban                → +50
- *   nome                → +30
- *   descricao_fracao    → +25
+ *   nome                → +30  (critério base, sem colisão)
+ *   descricao_fracao    → +25  (critério base, sem colisão)
  *   valor_fixo          → +15
  *   valor_quota_extra   → +10
  *
- * Threshold mínimo para identificação: score ≥ 55 (garante ≥2 critérios fortes)
+ * Colisão IBAN (ibanCandidatos.length > 1):
+ *   Desempate exclusivo com sub-critérios: nome(+35), entFrac(+30), entDesc(+25), descIsolada(+20)
+ *   Threshold desempate: score ≥ 55 E ≥2 critérios
+ *
+ * Threshold geral para identificação: score ≥ 55 E ≥2 critérios
  */
 export async function identifyByMultiMatch(
   input: MatchInput
@@ -691,7 +798,63 @@ export async function identifyByMultiMatch(
     ibanCandidatos = await getFracaoByIBAN(input.ibanSender);
   }
 
-  // Avaliar todas as frações
+  // ── Colisão IBAN: múltiplas frações com o mesmo IBAN ─────────────────────
+  // Em vez de pegar a primeira (bug!), calcular score de desempate
+  // apenas para as frações colididas.
+  if (ibanCandidatos.length > 1) {
+    const tieBreakers: Array<{ fracao: FracaoIdentidade; score: number; criterios: MatchCriterio[] }> = [];
+
+    for (const candidato of ibanCandidatos) {
+      const { score, criterios } = calcularScoreDesempate(input, candidato);
+      tieBreakers.push({ fracao: candidato, score, criterios });
+      console.log(
+        `[identifyByMultiMatch] IBAN colisão desempate` +
+        ` fração=${candidato.idFracao} score=${score} criterios=[${criterios.join(",")}]` +
+        ` debtorName="${input.debtorName ?? ""}" descricao="${input.descricao ?? ""}"`,
+      );
+    }
+
+    // Ordenar por score desc
+    tieBreakers.sort((a, b) => b.score - a.score);
+    const winner = tieBreakers[0];
+    const runnerUp = tieBreakers[1];
+
+    // Empate exacto → não arriscar
+    if (winner.score === runnerUp.score) {
+      console.warn(
+        `[identifyByMultiMatch] IBAN colisão sem desempate claro` +
+        ` (${winner.fracao.idFracao} e ${runnerUp.fracao.idFracao} empatam com score=${winner.score})`,
+      );
+      return null;
+    }
+
+    // Threshold: score ≥ 55 E ≥2 critérios (inclui o iban que é garantido nas colididas)
+    const totalScore = 50 + winner.score; // +50 IBAN base + score desempate
+    const allCriterios: MatchCriterio[] = ["iban", ...winner.criterios];
+
+    if (totalScore < 55 || allCriterios.length < 2) {
+      console.warn(
+        `[identifyByMultiMatch] IBAN colisão — desempate insuficiente` +
+        ` fração=${winner.fracao.idFracao} totalScore=${totalScore} criterios=[${allCriterios.join(",")}]`,
+      );
+      return null;
+    }
+
+    // Vencedor encontrado
+    let ibanNovoAprendido = false;
+    if (input.ibanSender) {
+      ibanNovoAprendido = await learnIBAN(winner.fracao.idFracao, input.ibanSender);
+    }
+
+    return {
+      fracao: winner.fracao,
+      confidence: Math.min(100, totalScore),
+      criterios: allCriterios,
+      ibanNovoAprendido,
+    };
+  }
+
+  // ── Sem colisão: fluxo normal ─────────────────────────────────────────────
   for (const fracao of MATRIZ_PROPRIEDADES) {
     let score = 0;
     const criterios: MatchCriterio[] = [];
