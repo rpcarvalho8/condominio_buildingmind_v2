@@ -17,6 +17,11 @@ export const fracoes = sqliteTable("fracoes", {
   ibansConhecidos: text("ibans_conhecidos"),            // JSON array de IBANs associados (estáticos + aprendidos)
   quotaMensal: real("quota_mensal").notNull().default(0),
   permilagem: real("permilagem"),             // % do edifício
+  // Dívidas extra por tipo — actualizadas pela cascata de amortização
+  obrasDivida: real("obras_divida").default(0),
+  incendioDivida: real("incendio_divida").default(0),
+  indaquaDivida: real("indaqua_divida").default(0),
+  motorDivida: real("motor_divida").default(0),
   ativo: integer("ativo", { mode: "boolean" }).default(true),
   notas: text("notas"),
   createdAt: integer("created_at", { mode: "timestamp" })

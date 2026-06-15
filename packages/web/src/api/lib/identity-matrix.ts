@@ -17,6 +17,24 @@ import { db } from "../database";
 import { fracoes } from "../database/schema";
 import { eq, sql } from "drizzle-orm";
 
+// ─── Tipos de Cascata ─────────────────────────────────────────────────────────
+
+export interface CascataAplicacao {
+  tipo: keyof DividasAtuais;
+  valorAntes: number;
+  valorAmortizado: number;
+  valorDepois: number;
+}
+
+export interface CascataResult {
+  idFracao: string;
+  valorEntrada: number;
+  quotaLiquida: number;       // absorvido pela quota mensal (condominio + fundo reserva)
+  restoAmortizacao: number;   // montante que entrou na cascata
+  aplicacoes: CascataAplicacao[];
+  sobra: number;              // valor que ficou sem destino (crédito a favor)
+}
+
 // ─── Tipos ────────────────────────────────────────────────────────────────────
 
 export type EntradaLabel = "ENTRADA 21" | "ENTRADA 37" | "ENTRADA 39" | "GARAGEM" | "LOJAS";
@@ -766,7 +784,7 @@ export function totalDividasPorTipo(): Record<keyof DividasAtuais, number> {
 }
 
 /** Actualiza dividasAtuais de uma fração em memória após amortização.
- *  Nota: para persistência durable, actualizar a BD separadamente.
+ *  @deprecated Usar processarCascataAmortizacao() para persistência durable.
  */
 export function amortizarDivida(
   idFracao: string,
@@ -776,4 +794,119 @@ export function amortizarDivida(
   const fracao = getFracaoById(idFracao);
   if (!fracao) return;
   fracao.dividasAtuais[tipo] = Math.max(0, fracao.dividasAtuais[tipo] - valorPago);
+}
+
+// ─── Cascata de Amortização Dinâmica ─────────────────────────────────────────
+
+/**
+ * Processa a cascata de amortização para uma fração após recepção de pagamento.
+ *
+ * Ordem de prioridade (estrita): obras → indaqua → incendio → motor
+ *
+ * Fluxo:
+ *   1. Subtrai quota mensal líquida (condominio + fundoReserva) do montante recebido.
+ *   2. O restante percorre as dívidas extra por prioridade até esgotar.
+ *   3. Persiste os novos saldos em BD (UPDATE fracoes SET obras_divida=... etc).
+ *   4. Actualiza o objecto em memória para que lookups subsequentes sejam correctos.
+ *
+ * @param idFracao   ID da fração (ex: "L")
+ * @param amount     Montante total recebido (€)
+ * @param fracaoDB   Linha da BD (para obter fracaoId)
+ * @param mes        Mês do pagamento (1-12)
+ * @param ano        Ano do pagamento
+ * @returns CascataResult com breakdown completo, ou null se fração não encontrada
+ */
+export async function processarCascataAmortizacao(
+  idFracao: string,
+  amount: number,
+  fracaoDBId: string,
+  mes: number,
+  ano: number,
+): Promise<CascataResult | null> {
+  const fracao = getFracaoById(idFracao);
+  if (!fracao) return null;
+
+  // ── 1. Absorver quota mensal ──────────────────────────────────────────────
+  const quotaLiquida = fracao.valoresFixos.condominio + fracao.valoresFixos.fundoReserva;
+  let resto = Math.max(0, parseFloat((amount - quotaLiquida).toFixed(2)));
+
+  const result: CascataResult = {
+    idFracao,
+    valorEntrada: amount,
+    quotaLiquida,
+    restoAmortizacao: resto,
+    aplicacoes: [],
+    sobra: 0,
+  };
+
+  if (resto <= 0) {
+    result.sobra = 0;
+    return result;
+  }
+
+  // ── 2. Ler dívidas actuais da BD (fonte de verdade durable) ──────────────
+  const rows = await db.run(
+    sql`SELECT obras_divida, incendio_divida, indaqua_divida, motor_divida
+        FROM fracoes WHERE id = ${fracaoDBId} LIMIT 1`
+  );
+  const row = (rows as any).rows?.[0];
+
+  // Usar BD se disponível; caso contrário cair para memória (sistema fresh/seed)
+  const dividasBD: DividasAtuais = row
+    ? {
+        obras:    parseFloat((row.obras_divida as string | number) ?? 0) || 0,
+        incendio: parseFloat((row.incendio_divida as string | number) ?? 0) || 0,
+        indaqua:  parseFloat((row.indaqua_divida as string | number) ?? 0) || 0,
+        motor:    parseFloat((row.motor_divida as string | number) ?? 0) || 0,
+      }
+    : { ...fracao.dividasAtuais };
+
+  // ── 3. Aplicar cascata: obras → indaqua → incendio → motor ───────────────
+  const ordem: Array<keyof DividasAtuais> = ["obras", "indaqua", "incendio", "motor"];
+
+  const novasDividas = { ...dividasBD };
+
+  for (const tipo of ordem) {
+    if (resto <= 0) break;
+    const divida = novasDividas[tipo];
+    if (divida <= 0) continue;
+
+    const amortizado = parseFloat(Math.min(resto, divida).toFixed(2));
+    const antes = divida;
+    novasDividas[tipo] = parseFloat(Math.max(0, divida - amortizado).toFixed(2));
+    resto = parseFloat(Math.max(0, resto - amortizado).toFixed(2));
+
+    result.aplicacoes.push({
+      tipo,
+      valorAntes: antes,
+      valorAmortizado: amortizado,
+      valorDepois: novasDividas[tipo],
+    });
+  }
+
+  result.sobra = resto;
+
+  // ── 4. Persistir em BD ────────────────────────────────────────────────────
+  await db.run(
+    sql`UPDATE fracoes
+        SET obras_divida    = ${novasDividas.obras},
+            incendio_divida = ${novasDividas.incendio},
+            indaqua_divida  = ${novasDividas.indaqua},
+            motor_divida    = ${novasDividas.motor}
+        WHERE id = ${fracaoDBId}`
+  );
+
+  // ── 5. Actualizar memória ─────────────────────────────────────────────────
+  fracao.dividasAtuais.obras    = novasDividas.obras;
+  fracao.dividasAtuais.incendio = novasDividas.incendio;
+  fracao.dividasAtuais.indaqua  = novasDividas.indaqua;
+  fracao.dividasAtuais.motor    = novasDividas.motor;
+
+  console.log(
+    `[cascata] ${idFracao} — entrada €${amount.toFixed(2)}, quota €${quotaLiquida.toFixed(2)}, ` +
+    `amortizações: [${result.aplicacoes.map(a => `${a.tipo} -€${a.valorAmortizado}`).join(", ")}], ` +
+    `sobra €${result.sobra.toFixed(2)}`
+  );
+
+  return result;
 }

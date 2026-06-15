@@ -17,7 +17,7 @@ import * as schema from "../database/schema";
 import { eq, desc, and } from "drizzle-orm";
 import crypto from "node:crypto";
 import { recalcularSaldos } from "./dashboard";
-import { identifyByMultiMatch } from "../lib/identity-matrix";
+import { identifyByMultiMatch, processarCascataAmortizacao } from "../lib/identity-matrix";
 
 const CLIENT_ID = process.env.ENABLE_BANKING_CLIENT_ID ?? "";
 // Support both literal newlines and \n escape sequences in .env
@@ -241,6 +241,8 @@ async function importTransactions(transactions: any[], connectionId?: string): P
   const despesasToInsert: any[] = [];
   const quotasToInsert: any[] = [];
   const quotasToUpdate: any[] = [];
+  // Cascata: acumulamos durante o loop para processar após batch inserts
+  const cascataPendente: Array<{ idFracao: string; fracaoDBId: string; amount: number; mes: number; ano: number }> = [];
 
   for (const tx of transactions) {
     try {
@@ -318,6 +320,14 @@ async function importTransactions(transactions: any[], connectionId?: string): P
               });
               results.quotasCreated++;
             }
+            // Cascata: agendar amortização de dívidas com o excesso deste pagamento
+            cascataPendente.push({
+              idFracao: matrixResult.fracao.idFracao,
+              fracaoDBId: fracaoDB.id,
+              amount: valor,
+              mes,
+              ano,
+            });
           }
           continue;
         }
@@ -437,6 +447,22 @@ async function importTransactions(transactions: any[], connectionId?: string): P
         eq(schema.quotas.ano, q.ano),
         eq(schema.quotas.tipo, q.tipo),
       ));
+  }
+
+  // ── STEP 2b: Cascata de Amortização Dinâmica ─────────────────────────────
+  // Processa depois dos batch inserts para garantir que a quota foi criada antes de amortizar.
+  for (const entrada of cascataPendente) {
+    try {
+      await processarCascataAmortizacao(
+        entrada.idFracao,
+        entrada.amount,
+        entrada.fracaoDBId,
+        entrada.mes,
+        entrada.ano,
+      );
+    } catch (e: any) {
+      results.errors.push(`[cascata] ${entrada.idFracao}: ${e.message}`);
+    }
   }
 
   // ── STEP 3: Mark staged transactions as imported=1 ────────────────────────
