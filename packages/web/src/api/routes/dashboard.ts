@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { db } from "../database";
 import * as schema from "../database/schema";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and, sql, gt } from "drizzle-orm";
 import {
   REGRAS_CATIVO,
   identificarDestinoCativo,
@@ -681,29 +681,54 @@ export const dashboard = new Hono()
     const totalMorosos = morosos.reduce((s, m) => s + m.total, 0);
 
     // ===== SECÇÃO: OBRAS =====
-    const quotasObrasAtraso = await db
+    // Fonte primária: fracoes.obras_divida > 0 (seeded do Excel col L via seed-dividas.ts)
+    // Fallback: quotas table (tipo='obras', pago=false) — raramente tem dados
+    const obrasDividaBD = await db
       .select({
-        quota: schema.quotas,
-        fracao: schema.fracoes,
+        numero: schema.fracoes.numero,
+        proprietarioNome: schema.fracoes.proprietarioNome,
+        andar: schema.fracoes.andar,
+        obrasDivida: schema.fracoes.obrasDivida,
       })
-      .from(schema.quotas)
-      .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
-      .where(
-        and(
-          eq(schema.quotas.tipo, "obras"),
-          eq(schema.quotas.pago, false)
-        )
-      );
-    const morososObras = new Map<string, { fracao: any; quotas: any[]; total: number }>();
-    for (const row of quotasObrasAtraso) {
-      if (!row.fracao) continue;
-      const id = row.fracao.id;
-      if (!morososObras.has(id)) morososObras.set(id, { fracao: row.fracao, quotas: [], total: 0 });
-      morososObras.get(id)!.quotas.push(row.quota);
-      morososObras.get(id)!.total += row.quota.valor;
+      .from(schema.fracoes)
+      .where(gt(schema.fracoes.obrasDivida, 0));
+
+    let obrasEmAtraso: Array<{ fracao: any; quotas: any[]; total: number }>;
+    let totalObrasAtraso: number;
+
+    if (obrasDividaBD.length > 0) {
+      // Fonte directa: fracoes.obras_divida (Excel col L, seeded)
+      obrasEmAtraso = obrasDividaBD
+        .map(r => ({
+          fracao: {
+            id: r.numero!,
+            numero: r.numero!,
+            proprietarioNome: r.proprietarioNome ?? "",
+            andar: r.andar ?? 0,
+          },
+          total: Math.round((r.obrasDivida ?? 0) * 100) / 100,
+          quotas: [],
+        }))
+        .sort((a, b) => b.total - a.total);
+      totalObrasAtraso = Math.round(obrasEmAtraso.reduce((s, m) => s + m.total, 0) * 100) / 100;
+    } else {
+      // Fallback: quotas table tipo='obras' (raramente populada)
+      const quotasObrasAtraso = await db
+        .select({ quota: schema.quotas, fracao: schema.fracoes })
+        .from(schema.quotas)
+        .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
+        .where(and(eq(schema.quotas.tipo, "obras"), eq(schema.quotas.pago, false)));
+      const morososObrasMap = new Map<string, { fracao: any; quotas: any[]; total: number }>();
+      for (const row of quotasObrasAtraso) {
+        if (!row.fracao) continue;
+        const id = row.fracao.id;
+        if (!morososObrasMap.has(id)) morososObrasMap.set(id, { fracao: row.fracao, quotas: [], total: 0 });
+        morososObrasMap.get(id)!.quotas.push(row.quota);
+        morososObrasMap.get(id)!.total += row.quota.valor;
+      }
+      obrasEmAtraso = Array.from(morososObrasMap.values()).sort((a, b) => b.total - a.total);
+      totalObrasAtraso = obrasEmAtraso.reduce((s, m) => s + m.total, 0);
     }
-    const obrasEmAtraso = Array.from(morososObras.values()).sort((a, b) => b.total - a.total);
-    const totalObrasAtraso = obrasEmAtraso.reduce((s, m) => s + m.total, 0);
 
     // Obras pagas
     const quotasObrasPagas = await db
@@ -949,6 +974,7 @@ export const dashboard = new Hono()
 
     // Usar INDAQUA_DEVEDORES_EXCEL (col R Excel) como fonte de verdade
     const quotaExtraMorososDinamico = INDAQUA_DEVEDORES_EXCEL.filter(d => !elevPagosNums.has(d.fracao.numero));
+
     const quotaExtraAReceberDinamico = Math.round(quotaExtraMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
 
     // --- MOTOR GARAGEM ---
@@ -970,7 +996,7 @@ export const dashboard = new Hono()
     const motorDividaBD = await db
       .select({ numero: schema.fracoes.numero, motor: schema.fracoes.motorDivida })
       .from(schema.fracoes)
-      .where(sql`${schema.fracoes.motorDivida} > 0`);
+      .where(gt(schema.fracoes.motorDivida, 0));
 
     const motorMorososDinamico = motorDividaBD.length > 0
       ? motorDividaBD

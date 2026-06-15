@@ -387,7 +387,8 @@ function Overview({ d, setSecao, onRefresh }: any) {
     (d.fundoReserva?.totalEmAtraso ?? 0) +
     (d.incendio?.aReceber ?? 0) +
     (d.quotaExtra?.aReceber ?? 0) +
-    (d.portaoGaragem?.aReceber ?? 0);
+    (d.portaoGaragem?.aReceber ?? 0) +
+    (d.motor?.aReceber ?? 0);
 
   return (
     <>
@@ -478,21 +479,10 @@ function Overview({ d, setSecao, onRefresh }: any) {
               icon={<Zap size={20} />}
               onClick={() => setSecao("quotaExtra")}
             />
-            {/* Portão Garagem */}
+            {/* Quota Extra Motor */}
             <ContaCard
-              titulo="Portão Garagem"
-              banco={`Pago ${formatEuro(d.portaoGaragem?.pago ?? 0)} de ${formatEuro(d.portaoGaragem?.totalOrcamento ?? 707.25)}`}
-              saldo={d.portaoGaragem?.pago ?? 0}
-              aReceber={d.portaoGaragem?.aReceber ?? 0}
-              aReceberLabel={`${d.portaoGaragem?.morosos?.length ?? 0} frações por pagar`}
-              color="orange"
-              icon={<DoorOpen size={20} />}
-              onClick={() => setSecao("portaoGaragem")}
-            />
-            {/* Motor Garagem */}
-            <ContaCard
-              titulo="Motor Garagem"
-              banco="Quota extra"
+              titulo="Quota Extra Motor"
+              banco="Quota extra motor — Excel col U"
               saldo={0}
               saldoLabel="sem conta dedicada"
               aReceber={d.motor?.aReceber ?? 0}
