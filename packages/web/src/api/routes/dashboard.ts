@@ -454,11 +454,11 @@ export async function recalcularSaldos(): Promise<void> {
         eq(schema.quotas.pago, false),
       ));
     const atrasoFundoBD = fundoEmAtrasoRows.reduce((s, q) => s + (q.fundoReserva ?? 0), 0);
-    if (atrasoFundoBD > 0) {
-      await upsertSaldo("atraso_fundo_reserva", Math.round(atrasoFundoBD * 100) / 100);
-    }
+    // Persistir sempre (mesmo que zero — sobrescreve valor velho da BD)
+    await upsertSaldo("atraso_fundo_reserva", Math.round(atrasoFundoBD * 100) / 100);
 
-    // Saldo virtual FR = base estático + cativos FR ainda não transferidos
+    // Saldo virtual FR = base real (depósitos a prazo) + cativos FR ainda na Conta à Ordem
+    // Ex: 651.30 + 4.21 (Fração J pagou FR, ainda cativo) = 655.51
     const saldoFRVirtual = Math.round(
       (SALDO_DEFAULTS.saldo_fundo_reserva + cativos.fundo_reserva) * 100
     ) / 100;
@@ -652,7 +652,10 @@ export const dashboard = new Hono()
         sql`${schema.despesas.data} <= ${Math.floor(fimMes.getTime() / 1000)}`
       )
     );
-    const totalDespesasMes = despesasMes.reduce((sum, d) => sum + d.valor, 0);
+    const totalDespesasCategorizadasMes = despesasMes.reduce((sum, d) => sum + d.valor, 0);
+    // totalDespesasMes inclui débitos bancários não categorizados do mês (calculado abaixo após cativos)
+    // Para o cálculo inline do saldoMes usamos só as despesas categorizadas; debitosNaoCat adicionados no JSON final
+    const totalDespesasMes = totalDespesasCategorizadasMes;
     const saldoMes = receitaMes - totalDespesasMes;
 
     // ===== SECÇÃO: CONTA CORRENTE (morosos) =====
@@ -852,10 +855,56 @@ export const dashboard = new Hono()
     // Falha graciosamente se a tabela não existir (ambientes antigos).
     const cativos = await calcularValoresCativos();
 
+    // ===== DÉBITOS BANCÁRIOS NÃO CATEGORIZADOS (bank_transactions imported=0, amount<0) =====
+    // Saídas da conta à ordem ainda não categorizadas como despesas na DB.
+    // Reduzem o saldo operacional disponível e são somadas ao totalDespesasMes se forem de junho.
+    let debitosBancariosNaoCategorizados: Array<{
+      id: string; date: Date; amount: number; description: string | null; type: string | null;
+    }> = [];
+    let totalDebitosBancariosMes = 0;
+    let totalDebitosBancariosGlobal = 0;
+    try {
+      const debitosRows = await db
+        .select({
+          id: schema.bankTransactions.id,
+          date: schema.bankTransactions.date,
+          amount: schema.bankTransactions.amount,
+          description: schema.bankTransactions.description,
+          type: schema.bankTransactions.type,
+        })
+        .from(schema.bankTransactions)
+        .where(and(
+          eq(schema.bankTransactions.imported, 0),
+          sql`${schema.bankTransactions.amount} < 0`,
+        ));
+
+      debitosBancariosNaoCategorizados = debitosRows.map(r => ({
+        ...r,
+        date: r.date instanceof Date ? r.date : new Date((r.date as number) * 1000),
+        amount: Math.abs(r.amount), // positivo para somar
+      }));
+
+      for (const d of debitosBancariosNaoCategorizados) {
+        totalDebitosBancariosGlobal += d.amount;
+        // Se o débito for do mês actual, conta para despesas do mês
+        const dMes = d.date.getMonth() + 1;
+        const dAno = d.date.getFullYear();
+        if (dMes === mesAtual && dAno === anoAtual) {
+          totalDebitosBancariosMes += d.amount;
+        }
+      }
+      totalDebitosBancariosMes = Math.round(totalDebitosBancariosMes * 100) / 100;
+      totalDebitosBancariosGlobal = Math.round(totalDebitosBancariosGlobal * 100) / 100;
+    } catch (e) {
+      console.warn("[dashboard] Débitos bancários não categorizados:", e);
+    }
+
     // saldo_operacional_disponivel persiste em configuracoes via recalcularSaldos().
     // No GET, calculamos inline para garantir frescura mesmo sem sync recente.
+    // Cativos CRDT comprometem a conta mas não são despesas.
+    // Débitos DBIT (amount<0) reduzem o saldo mas ainda não estão categorizados.
     const saldoOperacionalDisponivel = Math.round(
-      (saldos.saldo_conta_corrente - cativos.totalCativos) * 100
+      (saldos.saldo_conta_corrente - cativos.totalCativos - totalDebitosBancariosGlobal) * 100
     ) / 100;
 
     // ===== PORTÃO GARAGEM e QUOTA EXTRA — derivados do extrasSecoes (100% dinâmico) =====
@@ -932,8 +981,11 @@ export const dashboard = new Hono()
       quotasMorosas: morosos.length,
       receitaMes,
       receitaPendente,
-      totalDespesasMes,
-      saldoMes,
+      // Despesas categorizadas na DB + débitos bancários não categorizados do mês
+      totalDespesasMes: Math.round((totalDespesasCategorizadasMes + totalDebitosBancariosMes) * 100) / 100,
+      totalDespesasCategorizadasMes: Math.round(totalDespesasCategorizadasMes * 100) / 100,
+      totalDebitosBancariosMes,
+      saldoMes: Math.round((receitaMes - totalDespesasCategorizadasMes - totalDebitosBancariosMes) * 100) / 100,
       evolucao,
       categoriasDespesas: categorias,
       orcamentoVsReal,
@@ -1013,7 +1065,43 @@ export const dashboard = new Hono()
         patterns: r.patterns.map(p => p.toString()),
         ibansSender: r.ibansSender ?? [],
       })),
+      // ── DÉBITOS BANCÁRIOS NÃO CATEGORIZADOS ───────────────────────────────
+      // Saídas da conta à ordem (amount<0, imported=0) ainda não inseridas em despesas.
+      // Já estão incluídos em totalDespesasMes e subtraídos do saldoOperacionalDisponivel.
+      debitosBancariosNaoCategorizados: {
+        totalMes: totalDebitosBancariosMes,
+        totalGlobal: totalDebitosBancariosGlobal,
+        movimentos: debitosBancariosNaoCategorizados,
+      },
     }, 200);
+  })
+  // POST /recalcular — força recalculo de todos os saldos e persiste em configuracoes
+  .post("/recalcular", async (c) => {
+    try {
+      await recalcularSaldos();
+      const saldos = await getSaldos();
+      return c.json({
+        ok: true,
+        mensagem: "Saldos recalculados com sucesso",
+        saldos: {
+          saldo_conta_corrente:        saldos.saldo_conta_corrente,
+          saldo_fundo_reserva:         saldos.saldo_fundo_reserva,
+          saldo_obras:                 saldos.saldo_obras,
+          saldo_quota_extra:           saldos.saldo_quota_extra,
+          saldo_operacional_disponivel: saldos.saldo_operacional_disponivel,
+          atraso_fundo_reserva:        saldos.atraso_fundo_reserva,
+          a_receber_obras:             saldos.a_receber_obras,
+          a_receber_quota_extra:       saldos.a_receber_quota_extra,
+          a_receber_portao:            saldos.a_receber_portao,
+          cativo_fundo_reserva:        saldos.cativo_fundo_reserva,
+          cativo_obras:                saldos.cativo_obras,
+          cativo_indaqua:              saldos.cativo_indaqua,
+        },
+      }, 200);
+    } catch (e: any) {
+      console.error("[POST /recalcular]", e);
+      return c.json({ ok: false, erro: e?.message ?? String(e) }, 500);
+    }
   })
   // Quick morosos count for sidebar badge
   .get("/morosos-count", async (c) => {
