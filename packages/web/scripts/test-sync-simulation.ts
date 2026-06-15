@@ -645,7 +645,6 @@ function imprimirRelatorio(resultados: TestResult[]) {
   console.log(`\n${C.bold}${C.yellow}  NOTAS / DESVIOS CONHECIDOS:${C.reset}`);
   console.log(`  ${C.yellow}• BD.fracoes.dividas está tudo a 0 — seed do Excel não foi aplicado à BD.${C.reset}`);
   console.log(`  ${C.yellow}• A cascata de amortização usa BD como fonte de verdade → sem efeito real até seed.${C.reset}`);
-  console.log(`  ${C.yellow}• quota_mensal BD ≠ condomínio+fundo da Matriz — BD usa quota "base" sem fundo incluso.${C.reset}`);
   console.log(`  ${C.yellow}• Fração AC partilha IBAN com J; AF partilha com N; AH partilha com AI — issue Excel conhecido.${C.reset}`);
   console.log(`${C.bold}${"═".repeat(60)}${C.reset}\n`);
 }
