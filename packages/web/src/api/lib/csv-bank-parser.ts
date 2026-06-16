@@ -475,8 +475,8 @@ export function parseCSV(filePath: string, conta: "condominio" | "obras"): Parse
 const CSV_SEARCH_PATHS = [
   // 1. packages/web/data/ — pasta persistente no repositório (destino preferido)
   path.join(process.cwd(), "data"),
+  path.join(process.cwd(), "packages/web/data"),
   path.join(process.cwd(), "../data"),
-  path.join(import.meta.dir, "../../data"),
   // 2. /tmp — fallback legado (volátil entre reinicios)
   "/tmp/bank_pdfs/2026/2026",
   "/tmp/bank_pdfs/2025_a/2025",
