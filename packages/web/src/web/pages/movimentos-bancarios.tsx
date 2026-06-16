@@ -42,11 +42,16 @@ async function apiFetch<T>(path: string): Promise<T> {
   return r.json();
 }
 
-async function patchClassificacao(id: string, classificacao: string): Promise<void> {
+async function patchClassificacao(
+  id: string,
+  classificacao: string,
+  debtorName?: string,
+): Promise<void> {
   const r = await fetch(`/api/bank-movements/${id}/classificacao`, {
     method: "PATCH",
     headers: { ...authHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify({ classificacao }),
+    // debtorName é usado pelo backend para inferir a fração e criar a quota
+    body: JSON.stringify({ classificacao, ...(debtorName ? { debtorName } : {}) }),
   });
   if (!r.ok) {
     const err = await r.json().catch(() => ({}));
@@ -93,10 +98,11 @@ function Toast({ message, onDone }: { message: string; onDone: () => void }) {
   );
 }
 
-function ClassDropdown({ id, current, onSave }: {
+function ClassDropdown({ id, current, debtorName, onSave }: {
   id: string;
   current: string;
-  onSave: (id: string, val: string) => Promise<void>;
+  debtorName?: string;
+  onSave: (id: string, val: string, debtorName?: string) => Promise<void>;
 }) {
   const [saving, setSaving] = useState(false);
 
@@ -105,7 +111,7 @@ function ClassDropdown({ id, current, onSave }: {
     if (!val) return;
     setSaving(true);
     try {
-      await onSave(id, val);
+      await onSave(id, val, debtorName);
     } finally {
       setSaving(false);
     }
@@ -177,7 +183,8 @@ export default function MovimentosBancariosPage() {
 
   // ── Mutation: gravar classificação + disparar cascata ──
   const classifyMutation = useMutation({
-    mutationFn: ({ id, val }: { id: string; val: string }) => patchClassificacao(id, val),
+    mutationFn: ({ id, val, debtorName }: { id: string; val: string; debtorName?: string }) =>
+      patchClassificacao(id, val, debtorName),
     onSuccess: () => {
       // Invalidar todos os dados dependentes — dashboard, lista, categorias
       qc.invalidateQueries({ queryKey: ["bm-lista"] });
@@ -189,8 +196,9 @@ export default function MovimentosBancariosPage() {
       qc.invalidateQueries({ queryKey: ["fracoes"] });
       qc.invalidateQueries({ queryKey: ["quotas"] });
       qc.invalidateQueries({ queryKey: ["morosos"] });
-      // Toast de confirmação
-      setToast("✨ Movimento reclassificado e saldos recalculados com sucesso!");
+      // Toast + reload forçado para garantir que não há cache a mascarar os dados reais
+      setToast("✨ Movimento reclassificado! A recarregar...");
+      setTimeout(() => window.location.reload(), 1200);
     },
     onError: (err: Error) => {
       setToast(`❌ Erro ao reclassificar: ${err.message}`);
@@ -392,7 +400,8 @@ export default function MovimentosBancariosPage() {
                           <ClassDropdown
                             id={m.id}
                             current={m.categoria}
-                            onSave={(id, val) => classifyMutation.mutateAsync({ id, val })}
+                            debtorName={m.nomeIdentificado}
+                            onSave={(id, val, dn) => classifyMutation.mutateAsync({ id, val, debtorName: dn })}
                           />
                         </td>
                         <td className={`px-4 py-3 text-right font-mono font-medium whitespace-nowrap ${

@@ -154,7 +154,7 @@ export const bankMovementsRoutes = new Hono()
   .patch("/:id/classificacao", requireAdmin, async (c) => {
     try {
       const id = c.req.param("id");
-      const body = await c.req.json<{ classificacao: string; fracaoId?: string }>();
+      const body = await c.req.json<{ classificacao: string; fracaoId?: string; debtorName?: string }>();
       const classificacao = body.classificacao as Classification;
 
       if (!VALID_CLASSIFICATIONS.includes(classificacao)) {
@@ -163,6 +163,9 @@ export const bankMovementsRoutes = new Hono()
           error: `Classificação inválida. Valores permitidos: ${VALID_CLASSIFICATIONS.join(", ")}`,
         }, 400);
       }
+
+      // LOG de diagnóstico — visível nos logs do servidor
+      console.log(`[PATCH classificacao] id=${id} classificacao=${classificacao} body.debtorName=${body.debtorName ?? "(none)"} fracaoId=${body.fracaoId ?? "(none)"}`);
 
       // ── Passo 1: Ler TXN ──────────────────────────────────────────────────
       const [txn] = await db
@@ -211,12 +214,16 @@ export const bankMovementsRoutes = new Hono()
       let quotaId: string | null = null;
 
       if (quotaTipo !== null) {
-        // Inferir fração: prioritizar fracaoId do body, depois debtorName, depois creditorName
+        // Inferir fração: fracaoId do body > debtorName do frontend > debtorName da DB > creditorName
+        // body.debtorName vem do campo nomeIdentificado da linha na UI
         const fracaoNumero = (
           body.fracaoId
+          ?? body.debtorName?.trim()
           ?? txn.debtorName?.trim()
           ?? txn.creditorName?.trim()
         )?.toUpperCase();
+
+        console.log(`[PATCH classificacao] quotaTipo=${quotaTipo} fracaoNumero=${fracaoNumero ?? "(none)"} txn.debtorName=${txn.debtorName ?? "(none)"} txn.creditorName=${txn.creditorName ?? "(none)"}`);
 
         if (fracaoNumero) {
           // Procurar fração na DB (match por numero)
@@ -229,6 +236,8 @@ export const bankMovementsRoutes = new Hono()
             f.numero.toUpperCase() === fracaoNumero ||
             fracaoNumero.startsWith(f.numero.toUpperCase() + " ")
           );
+
+          console.log(`[PATCH classificacao] fracaoMatch=${fracaoMatch ? `id=${fracaoMatch.id} num=${fracaoMatch.numero}` : "NENHUMA"}`);
 
           if (fracaoMatch) {
             const txDate = txn.date instanceof Date
@@ -301,6 +310,8 @@ export const bankMovementsRoutes = new Hono()
       //   • NÃO contar a TXN como cativo (imported=1)
       //   • Se quota foi criada: somar q.valor ao saldo_conta_corrente (pago=true)
       await recalcularSaldos();
+
+      console.log(`[PATCH classificacao] DONE id=${id} quotaCriada=${quotaCriada} quotaId=${quotaId ?? "none"}`);
 
       return c.json({
         ok: true,
