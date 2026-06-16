@@ -994,7 +994,12 @@ export const dashboard = new Hono()
     // NOTA: portão e motor partilham o mesmo quotaTipoId; motor_divida na BD distingue-os.
     // Como alternativa mais robusta: ler directamente de fracoes.motor_divida
     const motorDividaBD = await db
-      .select({ numero: schema.fracoes.numero, motor: schema.fracoes.motorDivida })
+      .select({
+        numero: schema.fracoes.numero,
+        proprietarioNome: schema.fracoes.proprietarioNome,
+        andar: schema.fracoes.andar,
+        motor: schema.fracoes.motorDivida,
+      })
       .from(schema.fracoes)
       .where(gt(schema.fracoes.motorDivida, 0));
 
@@ -1002,7 +1007,12 @@ export const dashboard = new Hono()
       ? motorDividaBD
           .filter(r => r.numero != null)
           .map(r => ({
-            fracao: { id: r.numero!, numero: r.numero!, proprietarioNome: "", andar: 0 },
+            fracao: {
+              id: r.numero!,
+              numero: r.numero!,
+              proprietarioNome: r.proprietarioNome ?? "",
+              andar: r.andar ?? 0,
+            },
             total: Math.round((r.motor ?? 0) * 100) / 100,
             quotas: [],
           }))
