@@ -173,6 +173,7 @@ export const bankTransactions = sqliteTable("bank_transactions", {
   description: text("description"),              // remittance_information concatenado
   creditorName: text("creditor_name"),           // nome do credor (saídas)
   debtorName: text("debtor_name"),               // nome do devedor/pagador (entradas)
+  debtorIban: text("debtor_iban"),               // IBAN do remetente — âncora de persistência antierro
   type: text("type"),                            // "CRDT" | "DBIT"
   status: text("status").default("pending"),     // "pending" | "processed" | "ignored"
   imported: integer("imported").default(0),      // 0=não processado, 1=importado

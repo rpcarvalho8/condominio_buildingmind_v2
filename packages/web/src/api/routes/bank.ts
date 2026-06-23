@@ -17,7 +17,8 @@ import * as schema from "../database/schema";
 import { eq, desc, and } from "drizzle-orm";
 import crypto from "node:crypto";
 import { recalcularSaldos } from "./dashboard";
-import { identifyByMultiMatch, processarCascataAmortizacao } from "../lib/identity-matrix";
+import { identifyByMultiMatch, processarCascataAmortizacao, learnIBAN } from "../lib/identity-matrix";
+import { llmIdentifyFracao, LLM_LEARN_THRESHOLD } from "../lib/llm-fallback";
 
 const CLIENT_ID = process.env.ENABLE_BANKING_CLIENT_ID ?? "";
 // Support both literal newlines and \n escape sequences in .env
@@ -146,6 +147,7 @@ async function stageTransactions(
     const txId: string | null = tx.transaction_id ?? tx.transactionId ?? null;
     const creditorName: string | null = tx.creditor?.name ?? tx.creditorName ?? null;
     const debtorName: string | null = tx.debtor?.name ?? tx.debtorName ?? null;
+    const debtorIban: string | null = tx.debtor?.account?.iban ?? tx.debtorIban ?? null;
 
     // Skip if already staged by external transaction_id
     if (txId) {
@@ -169,6 +171,7 @@ async function stageTransactions(
       description,
       creditorName,
       debtorName,
+      debtorIban,
       type: indicator || (isDebit ? "DBIT" : "CRDT"),
       status: "pending",
       imported: 0,
@@ -562,19 +565,23 @@ export async function processarStagedTransactions(): Promise<{
         continue;
       }
 
-      // Extrair IBAN do rawData — suporta tanto o formato Enable Banking real
-      // como o formato simplificado dos seeds QA: { iban_sender: "PTxx..." }
-      const ibanSender: string | undefined = txn.rawData
-        ? (() => {
-            try {
-              const d = JSON.parse(txn.rawData);
-              return d.iban_sender            // formato QA seed / simplificado
-                ?? d.debtor?.account?.iban    // Enable Banking real
-                ?? d.debtorIban              // camelCase legacy
-                ?? undefined;
-            } catch { return undefined; }
-          })()
-        : undefined;
+      // Extrair IBAN do remetente.
+      // Prioridade 1: coluna dedicada debtor_iban (gravada na ingestão — caminho rápido).
+      // Prioridade 2: fallback rawData para retrocompatibilidade com transações antigas
+      //               que entraram antes desta migração.
+      const ibanSender: string | undefined =
+        txn.debtorIban                         // P1: coluna direta
+        ?? (txn.rawData
+          ? (() => {
+              try {
+                const d = JSON.parse(txn.rawData);
+                return d.iban_sender            // formato QA seed / simplificado
+                  ?? d.debtor?.account?.iban    // Enable Banking real
+                  ?? d.debtorIban              // camelCase legacy
+                  ?? undefined;
+              } catch { return undefined; }
+            })()
+          : undefined);                        // P2: fallback rawData
 
       const matrixResult = await identifyByMultiMatch({
         descricao: txn.description ?? "",
@@ -584,21 +591,101 @@ export async function processarStagedTransactions(): Promise<{
       });
 
       if (!matrixResult || matrixResult.confidence < 55) {
-        // Motor não conseguiu identificar — requires_manual_review
+        // ── Camada 2: LLM Fallback ────────────────────────────────────────────
+        const llmResult = await llmIdentifyFracao({
+          descricao:   txn.description ?? "",
+          amount:      Math.abs(txn.amount ?? 0),
+          debtorName:  txn.debtorName ?? undefined,
+          ibanSender,
+        });
+
+        if (!llmResult.fracao || llmResult.confidence < 55) {
+          // LLM também não identificou — manual review
+          await db.update(schema.bankTransactions)
+            .set({ requiresManualReview: 1, status: "pending" })
+            .where(eq(schema.bankTransactions.id, txn.id));
+          summary.manualReview++;
+          summary.details.push({
+            transactionId: txId,
+            result: "manual_review",
+            score: llmResult.confidence,
+            motivo: `motor:${matrixResult?.confidence ?? 0} llm:${llmResult.confidence} provider:${llmResult.provider}`,
+          });
+          continue;
+        }
+
+        // LLM identificou com confiança suficiente — usar como resultado
+        // Ancorar IBAN se confiança alta o suficiente para auto-learning
+        let ibanAprendidoPorLLM = false;
+        if (llmResult.confidence >= LLM_LEARN_THRESHOLD && ibanSender) {
+          ibanAprendidoPorLLM = await learnIBAN(llmResult.fracao.idFracao, ibanSender);
+        }
+
+        // Continuar com o fluxo normal usando o resultado do LLM
+        const fracaoDBFromLLM = fracaoByNum.get(llmResult.fracao.idFracao.toUpperCase());
+        if (!fracaoDBFromLLM) {
+          throw new Error(`[LLM] Fração ${llmResult.fracao.idFracao} não encontrada na BD`);
+        }
+
+        const txDateLLM = txn.date instanceof Date ? txn.date : new Date((txn.date as number) * 1000);
+        const mesLLM    = txDateLLM.getMonth() + 1;
+        const anoLLM    = txDateLLM.getFullYear();
+        const valorLLM  = Math.abs(txn.amount ?? 0);
+
+        const existingQuotaLLM = await db.select({ id: schema.quotas.id })
+          .from(schema.quotas)
+          .where(and(
+            eq(schema.quotas.fracaoId, fracaoDBFromLLM.id),
+            eq(schema.quotas.mes, mesLLM),
+            eq(schema.quotas.ano, anoLLM),
+            eq(schema.quotas.tipo, "condominio"),
+          ))
+          .limit(1);
+
+        let quotaIdLLM: string;
+        const obsLLM = `[llm-fallback:${llmResult.provider}:${llmResult.confidence}%]${ibanAprendidoPorLLM ? " [IBAN aprendido]" : ""} ${llmResult.motivo}`;
+        if (existingQuotaLLM.length > 0) {
+          await db.update(schema.quotas)
+            .set({ pago: true, valor: valorLLM, dataPagamento: txDateLLM,
+                   metodoPagamento: "transferência", observacoes: obsLLM })
+            .where(eq(schema.quotas.id, existingQuotaLLM[0].id));
+          quotaIdLLM = existingQuotaLLM[0].id;
+        } else {
+          const insertedLLM = await db.insert(schema.quotas).values({
+            fracaoId: fracaoDBFromLLM.id,
+            tipo: "condominio",
+            mes: mesLLM, ano: anoLLM, valor: valorLLM,
+            fundoReserva: parseFloat((valorLLM * 0.1).toFixed(2)),
+            pago: true,
+            dataPagamento: txDateLLM,
+            metodoPagamento: "transferência",
+            observacoes: obsLLM,
+          }).returning({ id: schema.quotas.id });
+          quotaIdLLM = insertedLLM[0].id;
+        }
+
+        await processarCascataAmortizacao(
+          llmResult.fracao.idFracao, valorLLM, fracaoDBFromLLM.id, mesLLM, anoLLM
+        );
+
         await db.update(schema.bankTransactions)
-          .set({ requiresManualReview: 1, status: "pending" })
+          .set({ imported: 1, status: "processed", importType: "quota",
+                 importRefId: quotaIdLLM, requiresManualReview: 0 })
           .where(eq(schema.bankTransactions.id, txn.id));
-        summary.manualReview++;
+
+        summary.processed++;
         summary.details.push({
           transactionId: txId,
-          result: "manual_review",
-          score: matrixResult?.confidence ?? 0,
-          motivo: matrixResult ? `score ${matrixResult.confidence} < 55 ou < 2 critérios` : "nenhum match",
+          result: "processed",
+          fracao: llmResult.fracao.idFracao,
+          score: llmResult.confidence,
+          motivo: `llm-fallback:${llmResult.provider} | ${llmResult.motivo}`,
         });
         continue;
+        // ── Fim Camada 2 ──────────────────────────────────────────────────────
       }
 
-      // Motor identificou — fração confirmada
+      // Motor L1 identificou — fração confirmada
       const fracaoDB = fracaoByNum.get(matrixResult.fracao.idFracao.toUpperCase());
       if (!fracaoDB) {
         throw new Error(`Fração ${matrixResult.fracao.idFracao} não encontrada na BD`);
