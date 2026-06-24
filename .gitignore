@@ -31,3 +31,4 @@ Thumbs.db
 packages/web/drizzle/
 .env.keyfix
 packages/desktop/dist-electron/
+.git-credentials.env

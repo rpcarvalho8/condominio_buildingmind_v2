@@ -1,36 +1,45 @@
-# Task: Fix dívidas Dashboard — Excel Truth
+# TASK: Matriz Canónica de Orçamentos e Saldos
 
-## Dados reais do Excel (Valores_Condomínio_GsTnMD.xlsx)
-| FR | Nome | obras | incendio | indaqua | motor |
-|----|------|-------|---------|---------|-------|
-| L  | João Marco Coutinho | 2110.97 | 0.00 | 250.56 | 29.53 |
-| M  | Jannara Maria Santos | 108.85 | 0.00 | 0.00 | 0.00 |
-| N  | Filipe Daniel Teixeira | 178.63 | 0.00 | 33.78 | 0.00 |
-| X  | Alexandre Ribeiro Maia | 278.30 | 0.00 | 0.00 | 27.67 |
-| AG | João Pedro Amorim Dias | 284.27 | 0.00 | 0.00 | 25.04 |
-| AC | Maria Fátima Ascenção | 607.35 | 0.00 | 0.00 | 0.00 |
-| AD | Escutoglamour | 629.51 | 49.40 | 0.00 | 0.00 |
-| G  | Marma Concept | 1160.63 | 60.72 | 23.87 | 16.24 |
+## Alterações em dashboard.ts
 
-## Totais reais
-- obras_divida:    5358.51
-- incendio_divida:  110.12
-- indaqua_divida:   308.21
-- motor_divida:      98.48
-- TOTAL:           5875.32
+### 1. SALDO_DEFAULTS — âncora 15/06/2026
+- saldo_conta_corrente: 1806.74  (era 3388.39 — novo físico confirmado)
+- saldo_fundo_reserva: 651.30   (igual)
+- saldo_quota_extra: 110.45     (igual — depósito a prazo elevadores)
+- saldo_obras: 21185.29         (igual)
+- saldo_incendio: 0             (igual)
 
-## Problemas
-1. seed-dividas.ts lê identity-matrix.ts (stale) em vez do Excel
-2. dashboard.ts tem OBRAS_DEVEDORES_EXCEL hardcoded com valores errados (AG=581.86 devia ser 284.27)
-3. obras usa quotas table (vazia) com fallback stale
-4. motor não tem secção própria no dashboard
-5. indaqua/incendio hardcoded com listas antigas
+### 2. Constantes ORCAMENTOS_EXTRA (novo bloco)
+- ORCAMENTO_MOTOR: 707.25
+- ORCAMENTO_INCENDIO: 2644.50
+- ORCAMENTO_ELEVADORES: 6958.18
+- ORCAMENTO_OBRAS: 50550.04
 
-## Plano
-- [x] Ler Excel e confirmar dados
-- [ ] Reescrever seed-dividas.ts para ler xlsx diretamente
-- [ ] Atualizar OBRAS/INCENDIO constantes no dashboard.ts com dados reais
-- [ ] Adicionar lógica de motor como gaveta separada
-- [ ] Fazer seed + recalcular
-- [ ] tsc --noEmit
-- [ ] commit + push
+### 3. IBANs das poupanças físicas (ignorar saídas para eles)
+- A ser injetados em IBANS_POUPANCA_FISICA
+- Saídas DBIT para estes IBANs = transferência interna (ignorar no processamento)
+
+### 4. recalcularSaldos() — nova lógica de triagem
+DATA ANCORA: 2026-06-02 (hardcoded, não depende de saldo_base_data)
+
+Regras de triagem dos bank_transactions desde 02/06/2026:
+- Receitas Obras (cativo_obras) → saldo_obras += valor (imediato)
+- Receitas FR (cativo_fundo_reserva) → saldo_fundo_reserva += valor (imediato)
+- Receitas Motor/Incendio → permanecem como cativos virtuais na conta à ordem
+- Saídas para IBANS_POUPANCA_FISICA → ignorar (não são despesas)
+- Movimento 15.00€ → ignorar (teste)
+
+### 5. Morosidade por cota extra
+- em_divida_motor = ORCAMENTO_MOTOR − SUM(quotas pago=true WHERE quotaTipoId=PORTAO_TIPO_ID)
+- em_divida_incendio = ORCAMENTO_INCENDIO − SUM(quotas pago=true WHERE quotaTipoId=INCENDIO_TIPO_ID)
+- em_divida_elevadores = ORCAMENTO_ELEVADORES − SUM(quotas pago=true WHERE quotaTipoId=ELEV_TIPO_ID)
+- em_divida_obras = ORCAMENTO_OBRAS − SUM(quotas pago=true WHERE tipo='obras')
+- Persistir como: divida_total_motor, divida_total_incendio, divida_total_elevadores, divida_total_obras
+
+## Status
+- [ ] SALDO_DEFAULTS atualizado
+- [ ] ORCAMENTOS_EXTRA adicionado
+- [ ] IBANS_POUPANCA_FISICA adicionado
+- [ ] recalcularSaldos() atualizado
+- [ ] TSC 0 erros
+- [ ] Commit + push

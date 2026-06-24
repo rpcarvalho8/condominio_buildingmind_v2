@@ -60,6 +60,38 @@ const PORTAO_TIPO_ID   = "06d6dd01-04ac-4ea3-8359-ec705f78de7c";
 const ELEV_TIPO_ID     = "4696eef9-bd1f-46ff-a368-47cfd455eeca";
 const INCENDIO_TIPO_ID = "dd16bd50-a2ab-4387-9d70-95822b1a61d7";
 
+// ─── ORÇAMENTOS TOTAIS APROVADOS EM ASSEMBLEIA ───────────────────────────────
+// Fonte: Atas de Assembleia — valores com IVA, para o condomínio completo.
+// Utilizados para calcular a dívida global de cada cota extraordinária:
+//   em_divida = orcamento_total − total_já_arrecadado (quotas pago=true)
+const ORCAMENTO_MOTOR      =  707.25;   // Cota Extra Motor Garagem (portão)
+const ORCAMENTO_INCENDIO   = 2644.50;   // Cota Extra Incêndio / Seguro
+const ORCAMENTO_ELEVADORES = 6958.18;   // Cota Extra Elevadores (INDAQUA)
+const ORCAMENTO_OBRAS      = 50550.04;  // Cota Extra Obras
+
+// ─── IBANs DAS POUPANÇAS FÍSICAS (Depósitos a Prazo Santander) ──────────────
+// Saídas DBIT da Conta à Ordem para estes IBANs = transferências internas.
+// NÃO devem ser registadas como despesas nem reduzir o saldo operacional.
+// Fonte: Extratos Santander — contas dos depósitos a prazo do condomínio.
+const IBANS_POUPANCA_FISICA = new Set<string>([
+  // Depósito a Prazo — Fundo de Reserva
+  // Depósito a Prazo — Elevadores / Quota Extra
+  // Depósito a Prazo — Obras
+  // (adicionar IBANs reais quando disponíveis; usar formato sem espaços)
+  // Exemplo: "PT50003300004520936620005"
+]);
+
+// ─── ÂNCORA DE PROCESSAMENTO DE MOVIMENTOS BANCÁRIOS ────────────────────────
+// Data a partir da qual os movimentos da conta à ordem são processados
+// pela lógica de triagem (receitas → gavetas, cativos, etc.).
+// Corresponde ao início do período coberto pelos saldos ancorados de 15/06/2026.
+const ANCORA_MOVIMENTOS = new Date("2026-06-02T00:00:00.000Z");
+const ANCORA_TS = Math.floor(ANCORA_MOVIMENTOS.getTime() / 1000);
+
+// ─── MOVIMENTO TESTE (a ignorar sempre) ─────────────────────────────────────
+// Transferência de teste de 15,00€ — eliminar do processamento.
+const VALOR_TESTE_EUR = 15.00;
+
 // Fonte da verdade: Valores_Condomínio.xlsx col L ("Valores em dívida Quota Extra Obras")
 // Actualizado: 2026-06-15 — total real = 5358.51€
 const OBRAS_DEVEDORES_EXCEL = [
@@ -150,29 +182,40 @@ const FUNDO_RESERVA_DEVEDORES_EXCEL = [
 //   Excel diz L deve 213.99€ (quota+fundo Jan) mas ele pagou 589.23€ → em crédito para quotas futuras
 //   O totalEmAtraso real de quotas = Excel total - 213.99 (L já liquidou quota corrente)
 //   atraso_fundo_reserva: 28.41 Excel → corrigido: 28.41 - 23.99 (L pré-2026 fundo) + 2.79 (L Jan fundo resto) = 7.21
+// ─── SALDOS ANCORADOS A 15 DE JUNHO DE 2026 ─────────────────────────────────
+// Fonte: Extratos físicos Santander confirmados em 15/06/2026.
+// Estes valores são o ponto de partida (t=0) para o algoritmo de triagem.
+// Movimentos processados a partir de 02/06/2026 (ANCORA_MOVIMENTOS).
 const SALDO_DEFAULTS: Record<string, number> = {
-  saldo_conta_corrente: 3388.39, // saldo base confirmado 2026-06-13
-  saldo_fundo_reserva: 651.30,   // soma real depósitos a prazo FR: 250+83.58+104.60+85.23+127.89
-  atraso_fundo_reserva: 7.21,  // corrigido: L pagou 25.47 (23.99 pre-2026 fundo + parcial Jan)
-  saldo_obras: 21185.29,        // soma real 16 depósitos a prazo Obras (extrato Santander)
-  saldo_quota_extra: 110.45,    // depósito a prazo "Quota Extra" real (extrato Santander)
+  saldo_conta_corrente: 1806.74, // Saldo físico Conta à Ordem ancorado a 15/06/2026
+  saldo_fundo_reserva: 651.30,   // Depósito a Prazo Fundo de Reserva ancorado a 15/06/2026
+  atraso_fundo_reserva: 7.21,    // corrigido: L pagou 25.47 (23.99 pre-2026 fundo + parcial Jan)
+  saldo_obras: 21185.29,         // Depósito a Prazo Obras ancorado a 15/06/2026
+  saldo_quota_extra: 110.45,     // Depósito a Prazo Elevadores ancorado a 15/06/2026
   saldo_incendio: 0,
   a_receber_incendio: 157.98,
   a_receber_obras: 6006.05,
   a_receber_quota_extra: 1723.56,  // 1777.88 - 28.97(AH portão pago 07/05) - 25.35(AI portão pago 07/05)
   saldo_portao: 0,
   a_receber_portao: 593.27,  // 707.25 - 59.66(base) - 25.35(AI 07/05) - 28.97(AH 07/05) = 593.27
-  portao_pago: 113.98,        // 59.66 + 25.35(AI 07/05) + 28.97(AH 07/05)
+  portao_pago: 113.98,       // 59.66 + 25.35(AI 07/05) + 28.97(AH 07/05)
   // ── Valores cativos (dinheiro na Conta à Ordem ainda não transferido) ──────
-  // Recalculados dinamicamente a partir de bank_transactions com imported=0.
-  // Se não houver sync bancário, ficam a zero (nenhum cativo detectado).
+  // Motor e Incêndio ficam retidos como cativos virtuais na Conta à Ordem.
+  // FR e Obras são somados imediatamente às gavetas respectivas (não ficam cativos).
+  // Recalculados dinamicamente a partir de bank_transactions desde ANCORA_MOVIMENTOS.
   cativo_fundo_reserva: 0,
   cativo_indaqua: 0,
   cativo_incendio: 0,
   cativo_portao: 0,
   cativo_obras: 0,
   // saldo_operacional_disponivel = saldo_conta_corrente − soma de todos os cativos
-  saldo_operacional_disponivel: 3388.39,
+  saldo_operacional_disponivel: 1806.74,
+  // ── Dívida global por cota extraordinária (orçamento − total arrecadado) ──
+  // Calculados dinamicamente em recalcularSaldos() com base nos ORCAMENTOS_*.
+  divida_total_motor:      ORCAMENTO_MOTOR,
+  divida_total_incendio:   ORCAMENTO_INCENDIO,
+  divida_total_elevadores: ORCAMENTO_ELEVADORES,
+  divida_total_obras:      ORCAMENTO_OBRAS,
 };
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -347,9 +390,111 @@ async function upsertSaldo(chave: string, valor: number): Promise<void> {
 export async function recalcularSaldos(): Promise<void> {
 
   // ─────────────────────────────────────────────────────────────────────────────
+  // 0. TRIAGEM DE MOVIMENTOS BANCÁRIOS DESDE 02/06/2026
+  //    Lê bank_transactions com date >= ANCORA_MOVIMENTOS e classifica:
+  //      • Receitas Obras (cativo_obras)      → soma IMEDIATA ao saldo_obras
+  //      • Receitas FR (cativo_fundo_reserva) → soma IMEDIATA ao saldo_fundo_reserva
+  //      • Receitas Motor / Incêndio          → cativo virtual na Conta à Ordem
+  //      • Saídas para IBANs de poupanças     → ignorar (transferência interna)
+  //      • Movimento 15,00€ (teste)           → ignorar
+  // ─────────────────────────────────────────────────────────────────────────────
+  let acumObras  = 0; // receitas de obras somadas desde a âncora (já no prazo)
+  let acumFR     = 0; // receitas FR somadas desde a âncora (já no prazo)
+  let cativoMotor    = 0; // retidos na Conta à Ordem (não transferidos)
+  let cativoIncendio = 0;
+
+  try {
+    const movimentos = await db
+      .select({
+        id:          schema.bankTransactions.id,
+        date:        schema.bankTransactions.date,
+        amount:      schema.bankTransactions.amount,
+        description: schema.bankTransactions.description,
+        debtorName:  schema.bankTransactions.debtorName,
+        debtorIban:  schema.bankTransactions.debtorIban,
+
+        type:        schema.bankTransactions.type,
+        rawData:     schema.bankTransactions.rawData,
+      })
+      .from(schema.bankTransactions)
+      .where(sql`${schema.bankTransactions.date} >= ${ANCORA_TS}`);
+
+    for (const mov of movimentos) {
+      const valor = mov.amount ?? 0;
+      const desc  = (mov.description ?? "").trim();
+      const isCredito = valor > 0;
+      const isDebito  = valor < 0;
+      const absValor  = Math.abs(valor);
+
+      // ── Ignorar movimento de teste (15,00€ exacto) ──────────────────────
+      if (Math.abs(absValor - VALOR_TESTE_EUR) < 0.005) {
+        console.log(`[recalcularSaldos] Ignorado movimento teste 15€ — "${desc.slice(0, 60)}"`);
+        continue;
+      }
+
+      // ── Saídas para contas de poupança físicas (transferências internas) ─
+      if (isDebito && IBANS_POUPANCA_FISICA.size > 0) {
+        // Tentar extrair IBAN destino do rawData ou de campo dedicado
+        let ibanDestino: string | null = null;
+        try {
+          if (mov.rawData) {
+            const raw = JSON.parse(mov.rawData);
+            ibanDestino = raw.creditor?.account?.iban ?? raw.creditorIban ?? null;
+          }
+        } catch {}
+        const ibanNorm = (ibanDestino ?? "").replace(/\s/g, "").toUpperCase();
+        if (ibanNorm && IBANS_POUPANCA_FISICA.has(ibanNorm)) {
+          console.log(`[recalcularSaldos] Ignorada saída para poupança ${ibanNorm} — ${absValor.toFixed(2)}€`);
+          continue;
+        }
+      }
+
+      if (!isCredito) continue; // débitos normais processados noutras secções
+
+      // ── Classificar receita por gaveta ───────────────────────────────────
+      const descUp = desc.toUpperCase();
+      const isObras    = /\bOBRAS?\b/i.test(desc) || /COTA\s+(EXTRA\s+)?OBRAS/i.test(desc) || /QUOTA\s+(EXTRA\s+)?OBRAS/i.test(desc);
+      const isFR       = /FUNDO\s+DE?\s+RESERVA/i.test(desc) || /\bF\.?R\.?\b/.test(desc) || /FUNDO\s+RESERVA/i.test(desc) || /QUOTA\s+RESERVA/i.test(desc);
+      const isMotor    = /MOTOR\s+(DA\s+)?GARAGEM/i.test(desc) || /PORT[AÃ]O\s+(GARAGEM|MOTOR)/i.test(desc) || /COTA\s+(EXTRA\s+)?MOTOR/i.test(desc) || /QUOTA\s+(EXTRA\s+)?MOTOR/i.test(desc) || /COTA\s+(EXTRA\s+)?PORT[AÃ]O/i.test(desc) || /\bAH\s+COTA\s+EXTRA/i.test(desc) || /\bAI\s+COTA\s+EXTRA/i.test(desc);
+      const isIncendio = /INC[EÊ]NDIO/i.test(desc) || /SEGURO\s+(INCENDIO|INC[EÊ]NDIO)/i.test(desc) || /COTA\s+INC[EÊ]NDIO/i.test(desc) || /QUOTA\s+INC[EÊ]NDIO/i.test(desc);
+
+      if (isObras) {
+        // Receita de Obras → soma IMEDIATA ao depósito a prazo Obras
+        acumObras += absValor;
+        console.log(`[triagem] Obras +${absValor.toFixed(2)}€ — "${desc.slice(0, 60)}"`);
+      } else if (isFR) {
+        // Receita de FR → soma IMEDIATA ao depósito a prazo FR
+        acumFR += absValor;
+        console.log(`[triagem] Fundo Reserva +${absValor.toFixed(2)}€ — "${desc.slice(0, 60)}"`);
+      } else if (isMotor) {
+        // Motor → cativo virtual na Conta à Ordem (isolado visualmente)
+        cativoMotor += absValor;
+        console.log(`[triagem] Motor (cativo) +${absValor.toFixed(2)}€ — "${desc.slice(0, 60)}"`);
+      } else if (isIncendio) {
+        // Incêndio → cativo virtual na Conta à Ordem (isolado visualmente)
+        cativoIncendio += absValor;
+        console.log(`[triagem] Incêndio (cativo) +${absValor.toFixed(2)}€ — "${desc.slice(0, 60)}"`);
+      }
+      // Receitas normais (quotas condomínio) são processadas na secção 1
+    }
+
+    // Arredondar acumuladores
+    acumObras      = Math.round(acumObras * 100) / 100;
+    acumFR         = Math.round(acumFR * 100) / 100;
+    cativoMotor    = Math.round(cativoMotor * 100) / 100;
+    cativoIncendio = Math.round(cativoIncendio * 100) / 100;
+
+    if (acumObras > 0 || acumFR > 0 || cativoMotor > 0 || cativoIncendio > 0) {
+      console.log(`[recalcularSaldos] Triagem desde ${ANCORA_MOVIMENTOS.toISOString().slice(0,10)}: Obras+${acumObras}€ FR+${acumFR}€ CativoMotor=${cativoMotor}€ CativoIncendio=${cativoIncendio}€`);
+    }
+  } catch (e) {
+    console.error("[recalcularSaldos] triagem movimentos:", e);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
   // 1. CONTA CORRENTE
-  //    saldoBase + receitas_condominio_desde_ancora − despesas_desde_ancora
-  //    Nota: fundoReserva NÃO entra aqui (gaveta separada).
+  //    saldoBase (âncora 15/06/2026) + receitas_condominio_desde_ancora − despesas
+  //    Nota: fundoReserva NÃO entra aqui. Obras e FR já foram para gavetas próprias.
   // ─────────────────────────────────────────────────────────────────────────────
   let saldoContaCorrente = SALDO_DEFAULTS.saldo_conta_corrente;
 
@@ -359,56 +504,69 @@ export async function recalcularSaldos(): Promise<void> {
     const saldoBase = parseFloat(cfg.saldo_base_valor ?? "0");
     const saldoBaseData = cfg.saldo_base_data; // "YYYY-MM-DD"
 
-    if (saldoBase > 0 && saldoBaseData) {
-      const baseTs = Math.floor(new Date(saldoBaseData).getTime() / 1000);
+    // Usar saldo_base_data se configurado; caso contrário usar âncora canónica 15/06/2026
+    const baseTs = (saldoBase > 0 && saldoBaseData)
+      ? Math.floor(new Date(saldoBaseData).getTime() / 1000)
+      : ANCORA_TS;
+    const saldoBaseEfetivo = (saldoBase > 0 && saldoBaseData)
+      ? saldoBase
+      : SALDO_DEFAULTS.saldo_conta_corrente;
 
-      // Apenas q.valor (parte operacional) — fundoReserva fica na sua gaveta
-      const quotasDesdeBase = await db
-        .select({ valor: schema.quotas.valor })
-        .from(schema.quotas)
-        .where(and(
-          eq(schema.quotas.tipo, "condominio"),
-          eq(schema.quotas.pago, true),
-          sql`${schema.quotas.dataPagamento} >= ${baseTs}`,
-        ));
-      const receitasDesdeBase = quotasDesdeBase.reduce((s, q) => s + q.valor, 0);
+    // Apenas q.valor (parte operacional) — fundoReserva fica na sua gaveta
+    const quotasDesdeBase = await db
+      .select({ valor: schema.quotas.valor })
+      .from(schema.quotas)
+      .where(and(
+        eq(schema.quotas.tipo, "condominio"),
+        eq(schema.quotas.pago, true),
+        sql`${schema.quotas.dataPagamento} >= ${baseTs}`,
+      ));
+    const receitasDesdeBase = quotasDesdeBase.reduce((s, q) => s + q.valor, 0);
 
-      const despesasDesdeBase = await db
-        .select({ valor: schema.despesas.valor })
-        .from(schema.despesas)
-        .where(sql`${schema.despesas.data} >= ${baseTs}`);
-      const totalDespesasDesdeBase = despesasDesdeBase.reduce((s, d) => s + d.valor, 0);
+    const despesasDesdeBase = await db
+      .select({ valor: schema.despesas.valor })
+      .from(schema.despesas)
+      .where(sql`${schema.despesas.data} >= ${baseTs}`);
+    const totalDespesasDesdeBase = despesasDesdeBase.reduce((s, d) => s + d.valor, 0);
 
-      saldoContaCorrente = Math.round((saldoBase + receitasDesdeBase - totalDespesasDesdeBase) * 100) / 100;
-      await upsertSaldo("saldo_conta_corrente", saldoContaCorrente);
-    }
+    saldoContaCorrente = Math.round((saldoBaseEfetivo + receitasDesdeBase - totalDespesasDesdeBase) * 100) / 100;
+    await upsertSaldo("saldo_conta_corrente", saldoContaCorrente);
   } catch (e) {
     console.error("[recalcularSaldos] saldo_conta_corrente:", e);
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // 2. VALORES CATIVOS (bank_transactions não importadas)
-  //    Para cada movimento CRDT ainda não processado, classifica por gaveta.
-  //    Subtrai o total de cativos do saldo_conta_corrente para obter o saldo
-  //    operacional real disponível para despesas correntes.
-  //    Cada cativo aumenta também o saldo virtual da sua gaveta (UI).
+  // 2. VALORES CATIVOS (bank_transactions não importadas + triagem Motor/Incêndio)
+  //    Motor e Incêndio ficam retidos como cativos na Conta à Ordem.
+  //    FR e Obras vão imediatamente para as gavetas físicas (acumFR, acumObras).
   // ─────────────────────────────────────────────────────────────────────────────
   let cativos = {
     fundo_reserva: 0,
     indaqua: 0,
-    incendio: 0,
-    portao: 0,
+    incendio: cativoIncendio,
+    portao: cativoMotor,     // portão = motor garagem (mesma gaveta visual)
     obras: 0,
     total: 0,
   };
 
   try {
+    // calcularValoresCativos() lê bank_transactions(imported=0) — complementa a triagem
     const resultado = await calcularValoresCativos();
 
+    // Mesclar: cativo Motor/Incêndio da triagem + cativos do motor matricial
     cativos = {
-      ...resultado.porGaveta,
-      total: resultado.totalCativos,
+      fundo_reserva: resultado.porGaveta.fundo_reserva,
+      indaqua:       resultado.porGaveta.indaqua,
+      // Incêndio: triagem (cativoIncendio) + motor matricial (resultado)
+      incendio: Math.round((cativoIncendio + resultado.porGaveta.incendio) * 100) / 100,
+      // Portão/Motor: triagem (cativoMotor) + motor matricial (resultado)
+      portao:   Math.round((cativoMotor + resultado.porGaveta.portao) * 100) / 100,
+      obras:    resultado.porGaveta.obras,
+      total:    0,
     };
+    cativos.total = Math.round(
+      (cativos.fundo_reserva + cativos.indaqua + cativos.incendio + cativos.portao + cativos.obras) * 100
+    ) / 100;
 
     // Persistir cativos por gaveta
     await upsertSaldo("cativo_fundo_reserva", cativos.fundo_reserva);
@@ -417,11 +575,8 @@ export async function recalcularSaldos(): Promise<void> {
     await upsertSaldo("cativo_portao",        cativos.portao);
     await upsertSaldo("cativo_obras",         cativos.obras);
 
-    if (resultado.numMovimentos > 0) {
-      console.log(`[recalcularSaldos] ${resultado.numMovimentos} movimentos cativos detectados — total: ${cativos.total.toFixed(2)}€`);
-      for (const m of resultado.movimentos) {
-        console.log(`  [${m.gaveta}] ${m.amount.toFixed(2)}€ — "${(m.description ?? "").slice(0, 60)}" (match: ${m.matchedField})`);
-      }
+    if (resultado.numMovimentos > 0 || cativoMotor > 0 || cativoIncendio > 0) {
+      console.log(`[recalcularSaldos] Cativos totais: ${cativos.total.toFixed(2)}€ (Motor:${cativos.portao}€ Incêndio:${cativos.incendio}€ FR:${cativos.fundo_reserva}€)`);
     }
   } catch (e) {
     console.error("[recalcularSaldos] cativos:", e);
@@ -433,9 +588,8 @@ export async function recalcularSaldos(): Promise<void> {
 
   // ─────────────────────────────────────────────────────────────────────────────
   // 3. FUNDO DE RESERVA
-  //    saldo_fundo_reserva = estático (277.89) + cativos classificados como FR.
-  //    Nota: cativos.fundo_reserva já foi persistido em cativo_fundo_reserva.
-  //    Só actualizamos atraso_fundo_reserva (quotas não pagas).
+  //    saldo_fundo_reserva = base (651.30) + acumFR (receitas desde âncora) + cativos FR
+  //    Receitas FR desde 02/06: somadas imediatamente (já no prazo, não cativos)
   // ─────────────────────────────────────────────────────────────────────────────
   try {
     const fundoEmAtrasoRows = await db
@@ -446,13 +600,11 @@ export async function recalcularSaldos(): Promise<void> {
         eq(schema.quotas.pago, false),
       ));
     const atrasoFundoBD = fundoEmAtrasoRows.reduce((s, q) => s + (q.fundoReserva ?? 0), 0);
-    // Persistir sempre (mesmo que zero — sobrescreve valor velho da BD)
     await upsertSaldo("atraso_fundo_reserva", Math.round(atrasoFundoBD * 100) / 100);
 
-    // Saldo virtual FR = base real (depósitos a prazo) + cativos FR ainda na Conta à Ordem
-    // Ex: 651.30 + 4.21 (Fração J pagou FR, ainda cativo) = 655.51
+    // Saldo FR = base + receitas classificadas desde âncora + cativos FR ainda na conta
     const saldoFRVirtual = Math.round(
-      (SALDO_DEFAULTS.saldo_fundo_reserva + cativos.fundo_reserva) * 100
+      (SALDO_DEFAULTS.saldo_fundo_reserva + acumFR + cativos.fundo_reserva) * 100
     ) / 100;
     await upsertSaldo("saldo_fundo_reserva", saldoFRVirtual);
   } catch (e) {
@@ -461,8 +613,8 @@ export async function recalcularSaldos(): Promise<void> {
 
   // ─────────────────────────────────────────────────────────────────────────────
   // 4. OBRAS
-  //    a_receber_obras = DB (se existir) ou fallback Excel.
-  //    saldo_obras (virtual) = base + cativos de obras ainda na Conta à Ordem.
+  //    saldo_obras = base (21185.29) + acumObras (receitas obras desde âncora)
+  //    Receitas Obras desde 02/06: somadas imediatamente ao depósito a prazo.
   // ─────────────────────────────────────────────────────────────────────────────
   try {
     const obrasEmAtraso = await db
@@ -475,9 +627,9 @@ export async function recalcularSaldos(): Promise<void> {
       await upsertSaldo("a_receber_obras", Math.round(aReceberObrasBD * 100) / 100);
     }
 
-    // Saldo virtual obras = base real (depósitos a prazo) + cativos ainda na Conta à Ordem
+    // Saldo obras = base + receitas classificadas desde âncora (já no prazo físico)
     const saldoObrasVirtual = Math.round(
-      (SALDO_DEFAULTS.saldo_obras + cativos.obras) * 100
+      (SALDO_DEFAULTS.saldo_obras + acumObras) * 100
     ) / 100;
     await upsertSaldo("saldo_obras", saldoObrasVirtual);
   } catch (e) {
@@ -486,7 +638,7 @@ export async function recalcularSaldos(): Promise<void> {
 
   // ─────────────────────────────────────────────────────────────────────────────
   // 5. INDAQUA (Quota Extra Elevadores)
-  //    Identificação via observacoes LIKE '%INDAQUA%' (quotaTipoId=NULL na DB).
+  //    Identificação via observacoes LIKE '%INDAQUA%'.
   //    saldo_quota_extra (virtual) += cativos INDAQUA ainda na Conta à Ordem.
   // ─────────────────────────────────────────────────────────────────────────────
   try {
@@ -503,8 +655,6 @@ export async function recalcularSaldos(): Promise<void> {
 
     await upsertSaldo("a_receber_indaqua", Math.round(aReceberIndaqua * 100) / 100);
 
-    // Saldo virtual INDAQUA += cativos ainda na Conta à Ordem
-    // Saldo virtual INDAQUA = base real (depósito a prazo) + cativos ainda na Conta à Ordem
     const saldoIndaquaVirtual = Math.round(
       (SALDO_DEFAULTS.saldo_quota_extra + cativos.indaqua) * 100
     ) / 100;
@@ -515,8 +665,7 @@ export async function recalcularSaldos(): Promise<void> {
 
   // ─────────────────────────────────────────────────────────────────────────────
   // 6. INCÊNDIO
-  //    Identificação via observacoes LIKE '%ncen%'.
-  //    saldo_incendio (virtual) += cativos de incêndio ainda na Conta à Ordem.
+  //    saldo_incendio = cativos de incêndio retidos na Conta à Ordem.
   // ─────────────────────────────────────────────────────────────────────────────
   try {
     const incendioRows = await db
@@ -529,21 +678,19 @@ export async function recalcularSaldos(): Promise<void> {
     const aReceberIncendio = incendioRows.reduce((s, q) => s + q.valor, 0);
     await upsertSaldo("a_receber_incendio", Math.round(aReceberIncendio * 100) / 100);
 
-    // Saldo virtual incêndio += cativos ainda na Conta à Ordem
-    if (cativos.incendio > 0) {
-      const saldoIncendioVirtual = Math.round(
-        (SALDO_DEFAULTS.saldo_incendio + cativos.incendio) * 100
-      ) / 100;
-      await upsertSaldo("saldo_incendio", saldoIncendioVirtual);
-    }
+    // Saldo incêndio = cativos retidos (cativoIncendio da triagem + motor matricial)
+    const saldoIncendioVirtual = Math.round(
+      (SALDO_DEFAULTS.saldo_incendio + cativos.incendio) * 100
+    ) / 100;
+    await upsertSaldo("saldo_incendio", saldoIncendioVirtual);
   } catch (e) {
     console.error("[recalcularSaldos] incendio:", e);
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
   // 7. PORTÃO GARAGEM
-  //    a_receber_portao = Excel − pagos na DB (fallback se quotaTipoId vazio).
-  //    saldo_portao (virtual) += cativos de portão ainda na Conta à Ordem.
+  //    a_receber_portao = Excel − pagos na DB.
+  //    saldo_portao (virtual) = cativos Motor retidos na Conta à Ordem.
   // ─────────────────────────────────────────────────────────────────────────────
   try {
     const portaoPagosRows = await db
@@ -570,15 +717,13 @@ export async function recalcularSaldos(): Promise<void> {
     const pagoPortao = Math.round(portaoPagosValor.reduce((s, q) => s + q.valor, 0) * 100) / 100;
 
     await upsertSaldo("a_receber_portao", aReceberPortao);
-    await upsertSaldo("portao_pago", pagoPortao); // sempre upsert — inclui 0 para limpar valor stale
+    await upsertSaldo("portao_pago", pagoPortao);
 
-    // Saldo virtual portão += cativos ainda na Conta à Ordem
-    if (cativos.portao > 0) {
-      const saldoPortaoVirtual = Math.round(
-        (SALDO_DEFAULTS.saldo_portao + cativos.portao) * 100
-      ) / 100;
-      await upsertSaldo("saldo_portao", saldoPortaoVirtual);
-    }
+    // Saldo portão = cativos Motor retidos na Conta à Ordem
+    const saldoPortaoVirtual = Math.round(
+      (SALDO_DEFAULTS.saldo_portao + cativos.portao) * 100
+    ) / 100;
+    await upsertSaldo("saldo_portao", saldoPortaoVirtual);
   } catch (e) {
     console.error("[recalcularSaldos] portao:", e);
   }
@@ -603,6 +748,58 @@ export async function recalcularSaldos(): Promise<void> {
     await upsertSaldo("a_receber_quota_extra", aReceberElev);
   } catch (e) {
     console.error("[recalcularSaldos] quota_extra:", e);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 9. MOROSIDADE GLOBAL POR COTA EXTRAORDINÁRIA
+  //    divida_total = orcamento_aprovado − total_arrecadado (quotas pago=true)
+  //    Cálculo automático sem depender das listas Excel — usa a DB como fonte.
+  // ─────────────────────────────────────────────────────────────────────────────
+  try {
+    // Motor (Portão) — quotaTipoId = PORTAO_TIPO_ID
+    const motorPagoRows = await db
+      .select({ valor: schema.quotas.valor })
+      .from(schema.quotas)
+      .where(and(eq(schema.quotas.quotaTipoId, PORTAO_TIPO_ID), eq(schema.quotas.pago, true)));
+    const totalMotorArrecadado = Math.round(motorPagoRows.reduce((s, q) => s + q.valor, 0) * 100) / 100;
+    const dividaMotor = Math.max(0, Math.round((ORCAMENTO_MOTOR - totalMotorArrecadado) * 100) / 100);
+    await upsertSaldo("divida_total_motor", dividaMotor);
+
+    // Incêndio — quotaTipoId = INCENDIO_TIPO_ID
+    const incendioPagoRows = await db
+      .select({ valor: schema.quotas.valor })
+      .from(schema.quotas)
+      .where(and(eq(schema.quotas.quotaTipoId, INCENDIO_TIPO_ID), eq(schema.quotas.pago, true)));
+    const totalIncendioArrecadado = Math.round(incendioPagoRows.reduce((s, q) => s + q.valor, 0) * 100) / 100;
+    const dividaIncendio = Math.max(0, Math.round((ORCAMENTO_INCENDIO - totalIncendioArrecadado) * 100) / 100);
+    await upsertSaldo("divida_total_incendio", dividaIncendio);
+
+    // Elevadores — quotaTipoId = ELEV_TIPO_ID
+    const elevPagoRows2 = await db
+      .select({ valor: schema.quotas.valor })
+      .from(schema.quotas)
+      .where(and(eq(schema.quotas.quotaTipoId, ELEV_TIPO_ID), eq(schema.quotas.pago, true)));
+    const totalElevArrecadado = Math.round(elevPagoRows2.reduce((s, q) => s + q.valor, 0) * 100) / 100;
+    const dividaElevadores = Math.max(0, Math.round((ORCAMENTO_ELEVADORES - totalElevArrecadado) * 100) / 100);
+    await upsertSaldo("divida_total_elevadores", dividaElevadores);
+
+    // Obras — tipo='obras'
+    const obrasPagoRows = await db
+      .select({ valor: schema.quotas.valor })
+      .from(schema.quotas)
+      .where(and(eq(schema.quotas.tipo, "obras"), eq(schema.quotas.pago, true)));
+    const totalObrasArrecadado = Math.round(obrasPagoRows.reduce((s, q) => s + q.valor, 0) * 100) / 100;
+    const dividaObras = Math.max(0, Math.round((ORCAMENTO_OBRAS - totalObrasArrecadado) * 100) / 100);
+    await upsertSaldo("divida_total_obras", dividaObras);
+
+    console.log(
+      `[recalcularSaldos] Dívidas globais — Motor:${dividaMotor}€/${ORCAMENTO_MOTOR}€ ` +
+      `Incêndio:${dividaIncendio}€/${ORCAMENTO_INCENDIO}€ ` +
+      `Elevadores:${dividaElevadores}€/${ORCAMENTO_ELEVADORES}€ ` +
+      `Obras:${dividaObras}€/${ORCAMENTO_OBRAS}€`
+    );
+  } catch (e) {
+    console.error("[recalcularSaldos] morosidade global:", e);
   }
 }
 
