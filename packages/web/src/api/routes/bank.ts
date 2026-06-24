@@ -962,18 +962,34 @@ export const bankRoutes = new Hono()
       importResults.errors.push(`recalcularSaldos: ${e.message}`);
     }
 
-    // ── Varrer staging: processar TXNs que ficaram imported=0 ────────────────
-    // Inclui TXNs injectadas manualmente ou que falharam durante o sync
+    // ── Camada 2: LLM Fallback sobre TXNs em staging ─────────────────────────
+    let llmProcessedHTTP = 0;
+    let llmManualReviewHTTP = 0;
+    const llmProviderCountsHTTP: Record<string, number> = {};
     try {
       const stagedResult = await processarStagedTransactions();
-      if (stagedResult.processed > 0 || stagedResult.manualReview > 0) {
-        console.log(`[bank/sync] process-staged: ${stagedResult.processed} processadas, ${stagedResult.manualReview} para revisão manual`);
+      llmProcessedHTTP    = stagedResult.processed;
+      llmManualReviewHTTP = stagedResult.manualReview;
+      for (const d of stagedResult.details) {
+        if (d.result === "processed" && d.motivo?.startsWith("llm-fallback:")) {
+          const providerMatch = d.motivo.match(/^llm-fallback:([^\s|]+)/);
+          const provider = providerMatch ? providerMatch[1] : "llm";
+          llmProviderCountsHTTP[provider] = (llmProviderCountsHTTP[provider] ?? 0) + 1;
+        }
       }
       if (stagedResult.errors.length > 0) {
         importResults.errors.push(...stagedResult.errors.map(e => `[staged] ${e}`));
       }
+      const llmProviderSummaryHTTP = Object.entries(llmProviderCountsHTTP)
+        .map(([p, n]) => `${p}=${n}`).join(", ");
+      console.info(
+        `[bank/sync] ✅ Ciclo completo — ingeridas:${allTransactions.length} | ` +
+        `Barreira1(IBAN/Matriz):${importResults.quotasCreated}c+${importResults.quotasUpdated}u | ` +
+        `Camada2(LLM):${llmProcessedHTTP}${llmProviderSummaryHTTP ? ` [${llmProviderSummaryHTTP}]` : ""} | ` +
+        `ManualReview:${llmManualReviewHTTP} | Despesas:${importResults.despesasCreated}`
+      );
     } catch (e: any) {
-      console.error("[bank/sync] Erro ao processar staged:", e.message);
+      console.error("[bank/sync] Erro na Camada 2 (staged):", e.message);
       importResults.errors.push(`[staged] ${e.message}`);
     }
 
@@ -996,6 +1012,11 @@ export const bankRoutes = new Hono()
       period: { from: dateFrom.toISOString().slice(0, 10), to: dateTo.toISOString().slice(0, 10) },
       transactionsFound: allTransactions.length,
       ...importResults,
+      camada2: {
+        llmProcessed: llmProcessedHTTP,
+        manualReview: llmManualReviewHTTP,
+        providers: llmProviderCountsHTTP,
+      },
       syncErrors,
     });
   })
@@ -1103,18 +1124,59 @@ export async function runBankSync(): Promise<void> {
     console.error("[bank-cron] Erro ao recalcular saldos:", e.message);
   }
 
+  // ── Camada 2: LLM Fallback sobre TXNs em staging ─────────────────────────
+  // Processa todas as transações que ficaram imported=0 após o motor matricial.
+  let llmProcessed = 0;
+  let llmManualReview = 0;
+  const llmProviderCounts: Record<string, number> = {};
+  try {
+    const stagedResult = await processarStagedTransactions();
+    llmProcessed    = stagedResult.processed;
+    llmManualReview = stagedResult.manualReview;
+    // Contabilizar por provider LLM
+    for (const d of stagedResult.details) {
+      if (d.result === "processed" && d.motivo?.startsWith("llm-fallback:")) {
+        const providerMatch = d.motivo.match(/^llm-fallback:([^\s|]+)/);
+        const provider = providerMatch ? providerMatch[1] : "llm";
+        llmProviderCounts[provider] = (llmProviderCounts[provider] ?? 0) + 1;
+      }
+    }
+    if (stagedResult.errors.length > 0) {
+      importResults.errors.push(...stagedResult.errors.map(e => `[staged] ${e}`));
+    }
+  } catch (e: any) {
+    console.error("[bank-cron] Erro na Camada 2 (staged):", e.message);
+    importResults.errors.push(`[staged] ${e.message}`);
+  }
+
+  // ── Log estruturado do ciclo completo ────────────────────────────────────
+  const totalErrors = syncErrors.length + importResults.errors.length;
+  const llmProviderSummary = Object.entries(llmProviderCounts)
+    .map(([p, n]) => `${p}=${n}`).join(", ");
+
+  console.info(
+    `\n╔══════════════════════════════════════════════════════════════╗` +
+    `\n║  [bank-cron] SYNC ${new Date().toISOString().slice(0, 16).replace("T", " ")} PT                         ` +
+    `\n╠══════════════════════════════════════════════════════════════╣` +
+    `\n║  📥  Transações ingeridas:  ${String(allTransactions.length).padEnd(4)} (${importResults.staged} novas, ${importResults.stagingSkipped} duplicadas)` +
+    `\n║  🏦  Barreira 1 (IBAN/Matriz): ${String(importResults.quotasCreated + importResults.quotasUpdated).padEnd(4)} quotas (${importResults.quotasCreated} criadas, ${importResults.quotasUpdated} actualizadas)` +
+    `\n║  🤖  Camada 2 LLM:          ${String(llmProcessed).padEnd(4)} identificadas${llmProviderSummary ? ` [${llmProviderSummary}]` : ""}` +
+    `\n║  👁️  Revisão manual:         ${String(llmManualReview).padEnd(4)} pendentes` +
+    `\n║  📤  Despesas criadas:       ${String(importResults.despesasCreated).padEnd(4)}` +
+    `\n║  ⚠️  Erros:                  ${String(totalErrors).padEnd(4)}${totalErrors > 0 ? " ← ver sync log" : ""}` +
+    `\n╚══════════════════════════════════════════════════════════════╝\n`
+  );
+
   await db.insert(schema.bankSyncLogs).values({
     connectionId: connection.id,
     syncedFrom: dateFrom,
     syncedTo: dateTo,
     transactionsFound: allTransactions.length,
     despesasCreated: importResults.despesasCreated,
-    quotasCreated: importResults.quotasCreated,
+    quotasCreated: importResults.quotasCreated + llmProcessed,
     quotasUpdated: importResults.quotasUpdated,
     skipped: importResults.despesasSkipped,
     errors: JSON.stringify([...syncErrors, ...importResults.errors]),
-    status: syncErrors.length > 0 || importResults.errors.length > 0 ? "partial" : "ok",
+    status: totalErrors > 0 ? "partial" : "ok",
   });
-
-  console.log(`[bank-cron] Sync concluído: ${allTransactions.length} transações, ${importResults.despesasCreated} despesas criadas`);
 }
