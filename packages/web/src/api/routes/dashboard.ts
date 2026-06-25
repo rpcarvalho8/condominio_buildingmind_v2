@@ -19,6 +19,7 @@ import {
   ANCORA_DATA_CC,
   ANCORA_DATA_MOVIMENTOS,
   TOTAL_FRACOES,
+  MATRIZ_PROPRIEDADES,
 } from "../lib/identity-matrix";
 
 // ─────────────────────────────────────────────────────────
@@ -868,6 +869,75 @@ export async function recalcularSaldos(): Promise<void> {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CÁLCULO DE DÍVIDAS INDIVIDUAIS POR PERMILAGEM
+// Fórmula: dívida = max(0, orcamento_rubrica × permilagem/1000 − total_pago)
+// Fonte pagamentos: bank_transactions (rubrica_extra + fracaoId preenchidos
+// durante processarStagedTransactions).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface DividaFracao {
+  obras:      number;
+  motor:      number;
+  incendio:   number;
+  elevadores: number;
+}
+
+export async function calcularDividasIndividuais(): Promise<Record<string, DividaFracao>> {
+  // Buscar todos os pagamentos processados com rubrica_extra preenchida.
+  // bank_transactions não tem fracaoId diretamente — fazemos join via importRefId → quotas.id → quotas.fracaoId.
+  // Também incluímos transações onde a fração pode ser inferida via debtorIban (futuro).
+  const pagamentos = await db.select({
+    fracaoId:     schema.quotas.fracaoId,
+    fracaoNumero: schema.fracoes.numero,
+    rubricaExtra: schema.bankTransactions.rubricaExtra,
+    amount:       schema.bankTransactions.amount,
+  })
+  .from(schema.bankTransactions)
+  .innerJoin(schema.quotas, eq(schema.bankTransactions.importRefId, schema.quotas.id))
+  .innerJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
+  .where(and(
+    eq(schema.bankTransactions.imported, 1),
+    eq(schema.bankTransactions.status, "processed"),
+    sql`${schema.bankTransactions.amount} > 0`,
+    sql`${schema.bankTransactions.rubricaExtra} IS NOT NULL`,
+    sql`${schema.bankTransactions.rubricaExtra} != 'CONDOMINIO'`,
+  ));
+
+  // Acumular pagos por idFracao × rubrica
+  type RubricaKey = "OBRAS" | "MOTOR" | "INCENDIO" | "ELEVADORES";
+  const pagoPorFracao = new Map<string, Record<RubricaKey, number>>();
+
+  for (const p of pagamentos) {
+    if (!p.fracaoNumero) continue;
+    const idFracao = p.fracaoNumero.toUpperCase();
+    const rubrica = (p.rubricaExtra ?? "") as RubricaKey;
+    if (!["OBRAS", "MOTOR", "INCENDIO", "ELEVADORES"].includes(rubrica)) continue;
+
+    if (!pagoPorFracao.has(idFracao)) {
+      pagoPorFracao.set(idFracao, { OBRAS: 0, MOTOR: 0, INCENDIO: 0, ELEVADORES: 0 });
+    }
+    pagoPorFracao.get(idFracao)![rubrica] += Math.abs(p.amount ?? 0);
+  }
+
+  // Calcular dívida por fração usando permilagem da MATRIZ
+  const resultado: Record<string, DividaFracao> = {};
+  for (const fracao of MATRIZ_PROPRIEDADES) {
+    const id = fracao.idFracao.toUpperCase();
+    const fator = fracao.permilagem / 1000;
+    const pago = pagoPorFracao.get(id) ?? { OBRAS: 0, MOTOR: 0, INCENDIO: 0, ELEVADORES: 0 };
+
+    resultado[id] = {
+      obras:      Math.max(0, Math.round((ORCAMENTO_OBRAS      * fator - pago.OBRAS)      * 100) / 100),
+      motor:      Math.max(0, Math.round((ORCAMENTO_MOTOR      * fator - pago.MOTOR)      * 100) / 100),
+      incendio:   Math.max(0, Math.round((ORCAMENTO_INCENDIO   * fator - pago.INCENDIO)   * 100) / 100),
+      elevadores: Math.max(0, Math.round((ORCAMENTO_ELEVADORES * fator - pago.ELEVADORES) * 100) / 100),
+    };
+  }
+
+  return resultado;
+}
+
 export const dashboard = new Hono()
   .get("/", async (c) => {
     const agora = new Date();
@@ -943,56 +1013,50 @@ export const dashboard = new Hono()
     const totalMorosos = morosos.reduce((s, m) => s + m.total, 0);
 
     // ===== SECÇÃO: OBRAS =====
-    // Fonte primária: fracoes.obras_divida > 0 (seeded do Excel col L via seed-dividas.ts)
-    // Fallback: quotas table (tipo='obras', pago=false) — raramente tem dados
-    const obrasDividaBD = await db
-      .select({
-        numero: schema.fracoes.numero,
-        proprietarioNome: schema.fracoes.proprietarioNome,
-        andar: schema.fracoes.andar,
-        obrasDivida: schema.fracoes.obrasDivida,
-      })
-      .from(schema.fracoes)
-      .where(gt(schema.fracoes.obrasDivida, 0));
+    // Fonte primária: dividasIndividuais (permilagem × ORCAMENTO_OBRAS − pago via bank_transactions)
+    // Fallback: fracoes.obras_divida > 0 (seeded do Excel) → quotas table
+    const hasDividasIndividuais = Object.keys(dividasIndividuais).length > 0;
 
     let obrasEmAtraso: Array<{ fracao: any; quotas: any[]; total: number }>;
     let totalObrasAtraso: number;
 
-    if (obrasDividaBD.length > 0) {
-      // Fonte directa: fracoes.obras_divida (Excel col L, seeded)
-      obrasEmAtraso = obrasDividaBD
-        .map(r => ({
+    if (hasDividasIndividuais) {
+      // Fonte permilagem — buscar dados de display das frações
+      const allFracoesDisplay = await db.select({
+        id: schema.fracoes.id,
+        numero: schema.fracoes.numero,
+        proprietarioNome: schema.fracoes.proprietarioNome,
+        andar: schema.fracoes.andar,
+      }).from(schema.fracoes).where(eq(schema.fracoes.ativo, true));
+
+      obrasEmAtraso = allFracoesDisplay
+        .filter(f => (dividasIndividuais[f.numero.toUpperCase()]?.obras ?? 0) > 0)
+        .map(f => ({
           fracao: {
-            id: r.numero!,
-            numero: r.numero!,
-            proprietarioNome: r.proprietarioNome ?? "",
-            andar: r.andar ?? 0,
+            id: f.numero,
+            numero: f.numero,
+            proprietarioNome: f.proprietarioNome ?? "",
+            andar: f.andar ?? 0,
           },
-          total: Math.round((r.obrasDivida ?? 0) * 100) / 100,
+          total: dividasIndividuais[f.numero.toUpperCase()].obras,
           quotas: [],
         }))
         .sort((a, b) => b.total - a.total);
       totalObrasAtraso = Math.round(obrasEmAtraso.reduce((s, m) => s + m.total, 0) * 100) / 100;
     } else {
-      // Fallback: quotas table tipo='obras' (raramente populada)
-      const quotasObrasAtraso = await db
-        .select({ quota: schema.quotas, fracao: schema.fracoes })
-        .from(schema.quotas)
-        .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
-        .where(and(eq(schema.quotas.tipo, "obras"), eq(schema.quotas.pago, false)));
-      const morososObrasMap = new Map<string, { fracao: any; quotas: any[]; total: number }>();
-      for (const row of quotasObrasAtraso) {
-        if (!row.fracao) continue;
-        const id = row.fracao.id;
-        if (!morososObrasMap.has(id)) morososObrasMap.set(id, { fracao: row.fracao, quotas: [], total: 0 });
-        morososObrasMap.get(id)!.quotas.push(row.quota);
-        morososObrasMap.get(id)!.total += row.quota.valor;
-      }
-      obrasEmAtraso = Array.from(morososObrasMap.values()).sort((a, b) => b.total - a.total);
-      totalObrasAtraso = obrasEmAtraso.reduce((s, m) => s + m.total, 0);
+      // Fallback: fracoes.obras_divida (seeded do Excel)
+      const obrasDividaBD = await db
+        .select({ numero: schema.fracoes.numero, proprietarioNome: schema.fracoes.proprietarioNome, andar: schema.fracoes.andar, obrasDivida: schema.fracoes.obrasDivida })
+        .from(schema.fracoes).where(gt(schema.fracoes.obrasDivida, 0));
+      obrasEmAtraso = obrasDividaBD.map(r => ({
+        fracao: { id: r.numero!, numero: r.numero!, proprietarioNome: r.proprietarioNome ?? "", andar: r.andar ?? 0 },
+        total: Math.round((r.obrasDivida ?? 0) * 100) / 100,
+        quotas: [],
+      })).sort((a, b) => b.total - a.total);
+      totalObrasAtraso = Math.round(obrasEmAtraso.reduce((s, m) => s + m.total, 0) * 100) / 100;
     }
 
-    // Obras pagas
+    // Obras pagas (banco confirmado)
     const quotasObrasPagas = await db
       .select()
       .from(schema.quotas)
@@ -1129,6 +1193,16 @@ export const dashboard = new Hono()
 
     const saldos = await getSaldos();
 
+    // ===== DÍVIDAS INDIVIDUAIS POR PERMILAGEM =====================================
+    // Calculadas a partir de bank_transactions.rubrica_extra (preenchida durante sync).
+    // Se rubrica_extra não estiver populada (transações antigas), dívida = teto teórico total.
+    let dividasIndividuais: Record<string, DividaFracao> = {};
+    try {
+      dividasIndividuais = await calcularDividasIndividuais();
+    } catch (e) {
+      console.warn("[dashboard] calcularDividasIndividuais falhou:", e);
+    }
+
     // ===== VALORES CATIVOS — movimentos bancários não processados na Conta à Ordem =====
     // Lê bank_transactions(imported=0, amount>0) e classifica por gaveta via REGRAS_CATIVO.
     // Falha graciosamente se a tabela não existir (ambientes antigos).
@@ -1225,82 +1299,107 @@ export const dashboard = new Hono()
       : Math.round((707.25 - portaoAReceberDinamico) * 100) / 100;
 
     // --- INDAQUA + ELEVADORES (Quota Extra) ---
-    // Fonte: col R do Excel ("Valores em dívida Quota extra Indaqua + elevadores")
-    // Lógica: base Excel − quem já pagou na DB (via quotaTipoId ELEV)
-    const elevPagosRows = await db
-      .select({ numero: schema.fracoes.numero })
-      .from(schema.quotas)
-      .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
-      .where(and(
-        eq(schema.quotas.tipo, "extra"),
-        eq(schema.quotas.quotaTipoId, ELEV_TIPO_ID),
-        eq(schema.quotas.pago, true)
-      ));
-    const elevPagosNums = new Set(elevPagosRows.map(r => r.numero).filter(Boolean));
+    // Fonte primária: dividasIndividuais[idFracao].elevadores (permilagem × ORCAMENTO_ELEVADORES − pago)
+    // Fallback: INDAQUA_DEVEDORES_EXCEL − quem pagou na DB
+    let quotaExtraMorososDinamico: Array<{ fracao: any; quotas: any[]; total: number }>;
+    let quotaExtraAReceberDinamico: number;
 
-    // Usar INDAQUA_DEVEDORES_EXCEL (col R Excel) como fonte de verdade
-    const quotaExtraMorososDinamico = INDAQUA_DEVEDORES_EXCEL.filter(d => !elevPagosNums.has(d.fracao.numero));
-
-    const quotaExtraAReceberDinamico = Math.round(quotaExtraMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
-
-    // --- MOTOR GARAGEM ---
-    // Fonte: col U do Excel ("Valores em dívida Quota extra motor")
-    // Total real = 98.48€ para 4 frações
-    // Lógica: fracoes_com_divida_motor (fracoes.motor_divida > 0) − quem pagou na DB
-    const motorPagosRows = await db
-      .select({ numero: schema.fracoes.numero })
-      .from(schema.quotas)
-      .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
-      .where(and(
-        eq(schema.quotas.tipo, "extra"),
-        eq(schema.quotas.quotaTipoId, PORTAO_TIPO_ID), // portão = motor garagem (mesmo tipo)
-        eq(schema.quotas.pago, true)
-      ));
-    // Motor: usar MOTOR_DEVEDORES_EXCEL subtraindo pagamentos confirmados da DB
-    // NOTA: portão e motor partilham o mesmo quotaTipoId; motor_divida na BD distingue-os.
-    // Como alternativa mais robusta: ler directamente de fracoes.motor_divida
-    const motorDividaBD = await db
-      .select({
+    if (hasDividasIndividuais) {
+      const allFracoesElev = await db.select({
         numero: schema.fracoes.numero,
         proprietarioNome: schema.fracoes.proprietarioNome,
         andar: schema.fracoes.andar,
-        motor: schema.fracoes.motorDivida,
-      })
-      .from(schema.fracoes)
-      .where(gt(schema.fracoes.motorDivida, 0));
+      }).from(schema.fracoes).where(eq(schema.fracoes.ativo, true));
 
-    const motorMorososDinamico = motorDividaBD.length > 0
-      ? motorDividaBD
-          .filter(r => r.numero != null)
-          .map(r => ({
-            fracao: {
-              id: r.numero!,
-              numero: r.numero!,
-              proprietarioNome: r.proprietarioNome ?? "",
-              andar: r.andar ?? 0,
-            },
-            total: Math.round((r.motor ?? 0) * 100) / 100,
-            quotas: [],
-          }))
-          .sort((a, b) => b.total - a.total)
-      : MOTOR_DEVEDORES_EXCEL;
-    const motorAReceberDinamico = Math.round(motorMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
+      quotaExtraMorososDinamico = allFracoesElev
+        .filter(f => (dividasIndividuais[f.numero.toUpperCase()]?.elevadores ?? 0) > 0)
+        .map(f => ({
+          fracao: { id: f.numero, numero: f.numero, proprietarioNome: f.proprietarioNome ?? "", andar: f.andar ?? 0 },
+          total: dividasIndividuais[f.numero.toUpperCase()].elevadores,
+          quotas: [],
+        }))
+        .sort((a, b) => b.total - a.total);
+      quotaExtraAReceberDinamico = Math.round(quotaExtraMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
+    } else {
+      const elevPagosRows = await db
+        .select({ numero: schema.fracoes.numero })
+        .from(schema.quotas)
+        .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
+        .where(and(eq(schema.quotas.tipo, "extra"), eq(schema.quotas.quotaTipoId, ELEV_TIPO_ID), eq(schema.quotas.pago, true)));
+      const elevPagosNums = new Set(elevPagosRows.map(r => r.numero).filter(Boolean));
+      quotaExtraMorososDinamico = INDAQUA_DEVEDORES_EXCEL.filter(d => !elevPagosNums.has(d.fracao.numero));
+      quotaExtraAReceberDinamico = Math.round(quotaExtraMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
+    }
+
+    // --- MOTOR GARAGEM ---
+    // Fonte primária: dividasIndividuais[idFracao].motor (permilagem × ORCAMENTO_MOTOR − pago)
+    // Fallback: fracoes.motor_divida > 0 → MOTOR_DEVEDORES_EXCEL
+    let motorMorososDinamico: Array<{ fracao: any; quotas: any[]; total: number }>;
+    let motorAReceberDinamico: number;
+
+    if (hasDividasIndividuais) {
+      const allFracoesMotor = await db.select({
+        numero: schema.fracoes.numero,
+        proprietarioNome: schema.fracoes.proprietarioNome,
+        andar: schema.fracoes.andar,
+      }).from(schema.fracoes).where(eq(schema.fracoes.ativo, true));
+
+      motorMorososDinamico = allFracoesMotor
+        .filter(f => (dividasIndividuais[f.numero.toUpperCase()]?.motor ?? 0) > 0)
+        .map(f => ({
+          fracao: { id: f.numero, numero: f.numero, proprietarioNome: f.proprietarioNome ?? "", andar: f.andar ?? 0 },
+          total: dividasIndividuais[f.numero.toUpperCase()].motor,
+          quotas: [],
+        }))
+        .sort((a, b) => b.total - a.total);
+      motorAReceberDinamico = Math.round(motorMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
+    } else {
+      const motorDividaBD = await db.select({
+        numero: schema.fracoes.numero, proprietarioNome: schema.fracoes.proprietarioNome,
+        andar: schema.fracoes.andar, motor: schema.fracoes.motorDivida,
+      }).from(schema.fracoes).where(gt(schema.fracoes.motorDivida, 0));
+
+      motorMorososDinamico = motorDividaBD.length > 0
+        ? motorDividaBD.filter(r => r.numero != null).map(r => ({
+            fracao: { id: r.numero!, numero: r.numero!, proprietarioNome: r.proprietarioNome ?? "", andar: r.andar ?? 0 },
+            total: Math.round((r.motor ?? 0) * 100) / 100, quotas: [],
+          })).sort((a, b) => b.total - a.total)
+        : MOTOR_DEVEDORES_EXCEL;
+      motorAReceberDinamico = Math.round(motorMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
+    }
 
     // --- INCÊNDIO ---
-    // Fonte: col O do Excel ("Valores em dívida Quota Extra Incêndio")
-    // Total real = 110.12€ para 2 frações (G + AD)
-    const incPagosRows = await db
-      .select({ numero: schema.fracoes.numero })
-      .from(schema.quotas)
-      .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
-      .where(and(
-        eq(schema.quotas.tipo, "extra"),
-        eq(schema.quotas.quotaTipoId, INCENDIO_TIPO_ID),
-        eq(schema.quotas.pago, true)
-      ));
-    const incPagosNums = new Set(incPagosRows.map(r => r.numero).filter(Boolean));
-    const incendioMorososDinamico = INCENDIO_DEVEDORES_EXCEL.filter(d => !incPagosNums.has(d.fracao.numero));
-    const incendioAReceberDinamico = Math.round(incendioMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
+    // Fonte primária: dividasIndividuais[idFracao].incendio (permilagem × ORCAMENTO_INCENDIO − pago)
+    // Fallback: INCENDIO_DEVEDORES_EXCEL − quem pagou na DB
+    let incendioMorososDinamico: Array<{ fracao: any; quotas: any[]; total: number }>;
+    let incendioAReceberDinamico: number;
+
+    if (hasDividasIndividuais) {
+      const allFracoesInc = await db.select({
+        numero: schema.fracoes.numero,
+        proprietarioNome: schema.fracoes.proprietarioNome,
+        andar: schema.fracoes.andar,
+      }).from(schema.fracoes).where(eq(schema.fracoes.ativo, true));
+
+      incendioMorososDinamico = allFracoesInc
+        .filter(f => (dividasIndividuais[f.numero.toUpperCase()]?.incendio ?? 0) > 0)
+        .map(f => ({
+          fracao: { id: f.numero, numero: f.numero, proprietarioNome: f.proprietarioNome ?? "", andar: f.andar ?? 0 },
+          total: dividasIndividuais[f.numero.toUpperCase()].incendio,
+          quotas: [],
+        }))
+        .sort((a, b) => b.total - a.total);
+      incendioAReceberDinamico = Math.round(incendioMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
+    } else {
+      const incPagosRows = await db
+        .select({ numero: schema.fracoes.numero })
+        .from(schema.quotas)
+        .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
+        .where(and(eq(schema.quotas.tipo, "extra"), eq(schema.quotas.quotaTipoId, INCENDIO_TIPO_ID), eq(schema.quotas.pago, true)));
+      const incPagosNums = new Set(incPagosRows.map(r => r.numero).filter(Boolean));
+      incendioMorososDinamico = INCENDIO_DEVEDORES_EXCEL.filter(d => !incPagosNums.has(d.fracao.numero));
+      incendioAReceberDinamico = Math.round(incendioMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
+    }
 
     return c.json({
       mesAtual,
@@ -1329,47 +1428,46 @@ export const dashboard = new Hono()
       },
       obras: {
         totalPago: totalObrasPago,
-        // Fonte primária: fracoes.obras_divida (seeded do Excel col L)
-        // Fallback: quotas table > configuracoes > Excel hardcoded
-        totalAtraso: totalObrasAtraso > 0
-          ? totalObrasAtraso
-          : (saldos.a_receber_obras ?? OBRAS_DEVEDORES_EXCEL.reduce((s, d) => s + d.total, 0)),
-        totalTotal: totalObrasTotal > 0
-          ? totalObrasTotal
-          : (totalObrasPago + (saldos.a_receber_obras ?? OBRAS_DEVEDORES_EXCEL.reduce((s, d) => s + d.total, 0))),
-        fracoesEmAtraso: obrasEmAtraso.length > 0 ? obrasEmAtraso.length : OBRAS_DEVEDORES_EXCEL.length,
-        morosos: obrasEmAtraso.length > 0 ? obrasEmAtraso : OBRAS_DEVEDORES_EXCEL,
+        // Fonte primária: dividasIndividuais (permilagem × orcamento − pago via rubrica_extra)
+        // Fallback: fracoes.obras_divida (seeded do Excel) → configuracoes
+        totalAtraso: totalObrasAtraso,
+        totalTotal: totalObrasTotal,
+        fracoesEmAtraso: obrasEmAtraso.length,
+        morosos: obrasEmAtraso,
         saldoConta: saldos.saldo_obras,
+        fonteDados: hasDividasIndividuais ? "permilagem" : "excel",
       },
       extras: extrasSecoes,
       fundoReserva: {
         saldoConta: saldos.saldo_fundo_reserva,
         totalEmAtraso: saldos.atraso_fundo_reserva,
-        // Devedores fundo reserva (da sheet 3, quotas condominio inclui FR)
         morosos: FUNDO_RESERVA_DEVEDORES_EXCEL,
       },
       incendio: {
-        // Fonte: col O Excel — total real 110.12€ (G: 60.72 + AD: 49.40)
-        // Dinâmico: Excel base − quem pagou na DB (via quotaTipoId INCENDIO)
+        // Fonte primária: dividasIndividuais[idFracao].incendio
+        // Fallback: INCENDIO_DEVEDORES_EXCEL − DB pagos
         saldoConta: saldos.saldo_incendio,
         aReceber: incendioAReceberDinamico,
         fracoesEmAtraso: incendioMorososDinamico.length,
         morosos: incendioMorososDinamico,
+        fonteDados: hasDividasIndividuais ? "permilagem" : "excel",
       },
       quotaExtra: {
-        // Fonte: col R Excel — Indaqua + Elevadores — total real 308.21€
-        // Dinâmico: INDAQUA_DEVEDORES_EXCEL − quem pagou na DB
+        // Fonte primária: dividasIndividuais[idFracao].elevadores
+        // Fallback: INDAQUA_DEVEDORES_EXCEL − DB pagos
         saldoConta: saldos.saldo_quota_extra,
-        aReceber: quotaExtraMorososDinamico.length > 0 ? quotaExtraAReceberDinamico : saldos.a_receber_quota_extra,
+        aReceber: quotaExtraAReceberDinamico,
         fracoesEmAtraso: quotaExtraMorososDinamico.length,
         morosos: quotaExtraMorososDinamico,
+        fonteDados: hasDividasIndividuais ? "permilagem" : "excel",
       },
       motor: {
-        // Fonte: col U Excel — Quota extra motor — total real 98.48€
-        // Dinâmico: lê fracoes.motor_divida > 0 directamente da BD (sempre actualizado pelo seed)
+        // Fonte primária: dividasIndividuais[idFracao].motor
+        // Fallback: fracoes.motor_divida → MOTOR_DEVEDORES_EXCEL
         aReceber: motorAReceberDinamico,
         fracoesEmAtraso: motorMorososDinamico.length,
         morosos: motorMorososDinamico,
+        fonteDados: hasDividasIndividuais ? "permilagem" : "excel",
       },
       portaoGaragem: {
         saldoConta: saldos.saldo_portao,
@@ -1382,6 +1480,8 @@ export const dashboard = new Hono()
       // Pagamentos bancários confirmados mas NÃO categorizados no Excel pelo condomínio
       // Estes criam discrepâncias entre o que o Excel mostra e a realidade bancária
       pagamentosNaoRegistados: PAGAMENTOS_NAO_CATEGORIZADOS,
+      // Mapa completo de dívidas por fração por rubrica (permilagem)
+      dividasIndividuais,
 
       // ── SALDO OPERACIONAL (nova gaveta de topo) ─────────────────────────────
       // saldoContaCorrenteTotal   = saldo físico Conta à Ordem (inclui cativos)

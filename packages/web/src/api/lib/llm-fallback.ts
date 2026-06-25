@@ -43,6 +43,8 @@ export interface LLMFallbackInput {
   ibanSender?: string;
 }
 
+export type RubricaExtra = "CONDOMINIO" | "OBRAS" | "MOTOR" | "INCENDIO" | "ELEVADORES";
+
 export interface LLMFallbackResult {
   /** ID da fração identificada (ex: "AB") ou null se não identificada */
   idFracao: string | null;
@@ -54,6 +56,8 @@ export interface LLMFallbackResult {
   motivo: string;
   /** Qual provider respondeu: "groq" | "openrouter" | "none" */
   provider: "groq" | "openrouter" | "none";
+  /** Rubrica financeira identificada pelo LLM */
+  rubrica: RubricaExtra;
 }
 
 // ─── System Prompt ────────────────────────────────────────────────────────────
@@ -73,13 +77,20 @@ A tua tarefa é identificar a fração a que pertence uma determinada transferê
 REGRAS OBRIGATÓRIAS:
 1. Responde EXCLUSIVAMENTE com um JSON válido, sem markdown, sem texto extra, sem explicações fora do JSON.
 2. O JSON deve ter exatamente esta estrutura:
-   {"idFracao":"<ID ou null>","confidence":<0-100>,"motivo":"<razão curta em português>"}
+   {"idFracao":"<ID ou null>","confidence":<0-100>,"motivo":"<razão curta em português>","rubrica":"<RUBRICA>"}
 3. "idFracao" deve ser um dos IDs da lista acima (ex: "J", "AB", "AC") ou null se não conseguires identificar.
 4. "confidence" é um inteiro de 0 a 100 que representa a tua certeza.
 5. Usa 0 para "impossível determinar" e 100 para "certeza absoluta".
 6. Se o nome do proprietário aparecer (mesmo parcialmente ou com erros ortográficos), aumenta a confiança.
 7. Se a descrição contiver referências à fração (ex: "2B", "3 ESQ", "GAR 36"), aumenta a confiança.
-8. Nunca inventes uma fração que não existe na lista.`;
+8. Nunca inventes uma fração que não existe na lista.
+9. "rubrica" OBRIGATÓRIO — classifica a natureza do pagamento com UM destes valores exatos:
+   - "CONDOMINIO": quota mensal de condomínio (manutenção corrente)
+   - "OBRAS": cota extra para fundo de obras / obras extraordinárias
+   - "MOTOR": cota extra motor/portão de garagem
+   - "INCENDIO": cota extra seguro de incêndio
+   - "ELEVADORES": cota extra elevadores / INDAQUA
+   Em caso de dúvida, usa "CONDOMINIO".`;
 }
 
 function buildUserPrompt(input: LLMFallbackInput): string {
@@ -95,10 +106,13 @@ function buildUserPrompt(input: LLMFallbackInput): string {
 
 // ─── Parsers de resposta ──────────────────────────────────────────────────────
 
+const RUBRICAS_VALIDAS: RubricaExtra[] = ["CONDOMINIO", "OBRAS", "MOTOR", "INCENDIO", "ELEVADORES"];
+
 interface RawLLMResponse {
   idFracao: string | null;
   confidence: number;
   motivo: string;
+  rubrica: RubricaExtra;
 }
 
 function parseResponse(raw: string): RawLLMResponse | null {
@@ -108,10 +122,15 @@ function parseResponse(raw: string): RawLLMResponse | null {
     if (!match) return null;
     const obj = JSON.parse(match[0]);
     if (typeof obj.confidence !== "number") return null;
+    const rubricaRaw = typeof obj.rubrica === "string" ? obj.rubrica.trim().toUpperCase() : "CONDOMINIO";
+    const rubrica: RubricaExtra = RUBRICAS_VALIDAS.includes(rubricaRaw as RubricaExtra)
+      ? (rubricaRaw as RubricaExtra)
+      : "CONDOMINIO";
     return {
       idFracao:   typeof obj.idFracao === "string" ? obj.idFracao.trim().toUpperCase() : null,
       confidence: Math.min(100, Math.max(0, Math.round(obj.confidence))),
       motivo:     typeof obj.motivo === "string" ? obj.motivo : "",
+      rubrica,
     };
   } catch {
     return null;
@@ -219,6 +238,7 @@ export async function llmIdentifyFracao(
     fracao:     null,
     motivo:     "LLM não disponível ou não identificou",
     provider:   "none",
+    rubrica:    "CONDOMINIO",
   };
 
   // Se não há chaves configuradas, não tentar
@@ -273,5 +293,6 @@ export async function llmIdentifyFracao(
     fracao,
     motivo:     parsed.motivo,
     provider,
+    rubrica:    parsed.rubrica,
   };
 }

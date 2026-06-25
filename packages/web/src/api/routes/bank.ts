@@ -18,7 +18,20 @@ import { eq, desc, and } from "drizzle-orm";
 import crypto from "node:crypto";
 import { recalcularSaldos } from "./dashboard";
 import { identifyByMultiMatch, processarCascataAmortizacao, learnIBAN } from "../lib/identity-matrix";
-import { llmIdentifyFracao, LLM_LEARN_THRESHOLD } from "../lib/llm-fallback";
+import { llmIdentifyFracao, LLM_LEARN_THRESHOLD, type RubricaExtra } from "../lib/llm-fallback";
+
+/**
+ * Infere a rubrica financeira a partir do descritivo da transação.
+ * Usado na Camada L1 (motor matricial) onde o LLM não corre.
+ */
+function inferirRubricaDeDescricao(descricao: string): RubricaExtra {
+  const d = descricao.toUpperCase();
+  if (/\bOBRAS?\b|COTA\s+(EXTRA\s+)?OBRAS|QUOTA\s+(EXTRA\s+)?OBRAS/.test(d)) return "OBRAS";
+  if (/MOTOR\s+(DA\s+)?GARAGEM|PORT[AÃ]O\s+(GARAGEM|MOTOR)|COTA\s+(EXTRA\s+)?MOTOR|QUOTA\s+(EXTRA\s+)?MOTOR|COTA\s+(EXTRA\s+)?PORT[AÃ]O|\bAH\s+COTA\s+EXTRA|\bAI\s+COTA\s+EXTRA/.test(d)) return "MOTOR";
+  if (/INC[EÊ]NDIO|SEGURO\s+(INCENDIO|INC[EÊ]NDIO)|COTA\s+INC[EÊ]NDIO|QUOTA\s+INC[EÊ]NDIO/.test(d)) return "INCENDIO";
+  if (/INDAQUA|ELEVADOR|ELEV\b|COTA\s+(EXTRA\s+)?ELEV|QUOTA\s+(EXTRA\s+)?ELEV/.test(d)) return "ELEVADORES";
+  return "CONDOMINIO";
+}
 
 const CLIENT_ID = process.env.ENABLE_BANKING_CLIENT_ID ?? "";
 // Support both literal newlines and \n escape sequences in .env
@@ -670,7 +683,8 @@ export async function processarStagedTransactions(): Promise<{
 
         await db.update(schema.bankTransactions)
           .set({ imported: 1, status: "processed", importType: "quota",
-                 importRefId: quotaIdLLM, requiresManualReview: 0 })
+                 importRefId: quotaIdLLM, requiresManualReview: 0,
+                 rubricaExtra: llmResult.rubrica })
           .where(eq(schema.bankTransactions.id, txn.id));
 
         summary.processed++;
@@ -747,6 +761,7 @@ export async function processarStagedTransactions(): Promise<{
           importType: "quota",
           importRefId: quotaId,
           requiresManualReview: 0,
+          rubricaExtra: inferirRubricaDeDescricao(txn.description ?? ""),
         })
         .where(eq(schema.bankTransactions.id, txn.id));
 
