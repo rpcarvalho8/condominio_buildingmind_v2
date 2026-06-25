@@ -88,6 +88,12 @@ const IBANS_POUPANCA_FISICA = new Set<string>([
 const ANCORA_MOVIMENTOS = new Date("2026-06-02T00:00:00.000Z");
 const ANCORA_TS = Math.floor(ANCORA_MOVIMENTOS.getTime() / 1000);
 
+// Âncora canónica da Conta Corrente — saldo físico confirmado em 15/06/2026: 1806.74€.
+// NUNCA substituir pelo saldo_base_valor/saldo_base_data da DB (esses são dados históricos
+// da Enable Banking e produzem valores errados como 3738.39€).
+const ANCORA_CC = new Date("2026-06-15T00:00:00.000Z");
+const ANCORA_CC_TS = Math.floor(ANCORA_CC.getTime() / 1000);
+
 // ─── MOVIMENTO TESTE (a ignorar sempre) ─────────────────────────────────────
 // Transferência de teste de 15,00€ — eliminar do processamento.
 const VALOR_TESTE_EUR = 15.00;
@@ -493,43 +499,96 @@ export async function recalcularSaldos(): Promise<void> {
 
   // ─────────────────────────────────────────────────────────────────────────────
   // 1. CONTA CORRENTE
-  //    saldoBase (âncora 15/06/2026) + receitas_condominio_desde_ancora − despesas
+  //    ÂNCORA CANÓNICA: 1806.74€ em 15/06/2026 — IMUTÁVEL.
+  //    Ignora saldo_base_valor/saldo_base_data da DB (valores históricos Enable Banking
+  //    que produzem incorrectamente 3738.39€).
+  //
+  //    CC = 1806.74
+  //       + SUM(quotas.valor WHERE tipo='condominio' AND pago=true AND dataPagamento >= 15/06/2026)
+  //       + SUM(bank_transactions.amount WHERE amount>0 AND date >= 15/06/2026
+  //             AND NÃO classificado como Obras/FR/Motor/Incêndio pela triagem)
+  //       − SUM(despesas.valor WHERE data >= 15/06/2026)
+  //
   //    Nota: fundoReserva NÃO entra aqui. Obras e FR já foram para gavetas próprias.
+  //          Motor e Incêndio são cativos — permanecem na CC mas visualmente isolados.
   // ─────────────────────────────────────────────────────────────────────────────
   let saldoContaCorrente = SALDO_DEFAULTS.saldo_conta_corrente;
 
   try {
-    const cfgRows = await db.select().from(schema.configuracoes);
-    const cfg = Object.fromEntries(cfgRows.map(r => [r.chave, r.valor]));
-    const saldoBase = parseFloat(cfg.saldo_base_valor ?? "0");
-    const saldoBaseData = cfg.saldo_base_data; // "YYYY-MM-DD"
-
-    // Usar saldo_base_data se configurado; caso contrário usar âncora canónica 15/06/2026
-    const baseTs = (saldoBase > 0 && saldoBaseData)
-      ? Math.floor(new Date(saldoBaseData).getTime() / 1000)
-      : ANCORA_TS;
-    const saldoBaseEfetivo = (saldoBase > 0 && saldoBaseData)
-      ? saldoBase
-      : SALDO_DEFAULTS.saldo_conta_corrente;
-
-    // Apenas q.valor (parte operacional) — fundoReserva fica na sua gaveta
-    const quotasDesdeBase = await db
+    // ── 1a. Receitas de condomínio desde âncora (quotas pagas na DB) ──────────
+    const quotasDesdeAnc = await db
       .select({ valor: schema.quotas.valor })
       .from(schema.quotas)
       .where(and(
         eq(schema.quotas.tipo, "condominio"),
         eq(schema.quotas.pago, true),
-        sql`${schema.quotas.dataPagamento} >= ${baseTs}`,
+        sql`${schema.quotas.dataPagamento} >= ${ANCORA_CC_TS}`,
       ));
-    const receitasDesdeBase = quotasDesdeBase.reduce((s, q) => s + q.valor, 0);
+    const receitasQuotasBD = quotasDesdeAnc.reduce((s, q) => s + q.valor, 0);
 
-    const despesasDesdeBase = await db
+    // ── 1b. Créditos bancários genéricos desde âncora (bank_transactions) ─────
+    //    Inclui tudo que é CRDT desde 15/06/2026, excepto:
+    //      • já classificados como Obras/FR pela triagem (acumObras, acumFR)
+    //      • cativos Motor/Incêndio (cativoMotor, cativoIncendio)
+    //      • movimentos de teste (15€)
+    //    Estes créditos representam quotas de condomínio pagas directamente por
+    //    transferência bancária ainda não importadas para a tabela quotas.
+    let creditosBancariosCC = 0;
+    try {
+      const movsBanco = await db
+        .select({
+          amount:      schema.bankTransactions.amount,
+          description: schema.bankTransactions.description,
+          rawData:     schema.bankTransactions.rawData,
+        })
+        .from(schema.bankTransactions)
+        .where(and(
+          sql`${schema.bankTransactions.date} >= ${ANCORA_CC_TS}`,
+          sql`${schema.bankTransactions.amount} > 0`,
+        ));
+
+      for (const mov of movsBanco) {
+        const valor   = mov.amount ?? 0;
+        const desc    = (mov.description ?? "").trim();
+        const absVal  = Math.abs(valor);
+
+        // Ignorar teste
+        if (Math.abs(absVal - VALOR_TESTE_EUR) < 0.005) continue;
+
+        // Ignorar se já contabilizado nas gavetas da triagem
+        const isObras    = /\bOBRAS?\b/i.test(desc) || /COTA\s+(EXTRA\s+)?OBRAS/i.test(desc) || /QUOTA\s+(EXTRA\s+)?OBRAS/i.test(desc);
+        const isFR       = /FUNDO\s+DE?\s+RESERVA/i.test(desc) || /\bF\.?R\.?\b/.test(desc) || /FUNDO\s+RESERVA/i.test(desc) || /QUOTA\s+RESERVA/i.test(desc);
+        const isMotor    = /MOTOR\s+(DA\s+)?GARAGEM/i.test(desc) || /PORT[AÃ]O\s+(GARAGEM|MOTOR)/i.test(desc) || /COTA\s+(EXTRA\s+)?MOTOR/i.test(desc) || /QUOTA\s+(EXTRA\s+)?MOTOR/i.test(desc) || /COTA\s+(EXTRA\s+)?PORT[AÃ]O/i.test(desc) || /\bAH\s+COTA\s+EXTRA/i.test(desc) || /\bAI\s+COTA\s+EXTRA/i.test(desc);
+        const isIncendio = /INC[EÊ]NDIO/i.test(desc) || /SEGURO\s+(INCENDIO|INC[EÊ]NDIO)/i.test(desc) || /COTA\s+INC[EÊ]NDIO/i.test(desc) || /QUOTA\s+INC[EÊ]NDIO/i.test(desc);
+
+        if (isObras || isFR || isMotor || isIncendio) continue;
+
+        // Crédito genérico → conta corrente
+        creditosBancariosCC += absVal;
+        console.log(`[recalcularSaldos] CC bancário +${absVal.toFixed(2)}€ — "${desc.slice(0, 60)}"`);
+      }
+      creditosBancariosCC = Math.round(creditosBancariosCC * 100) / 100;
+    } catch (eBanco) {
+      console.warn("[recalcularSaldos] Leitura bank_transactions para CC falhou:", eBanco);
+    }
+
+    // ── 1c. Despesas categorizadas desde âncora ────────────────────────────────
+    const despesasDesdeAnc = await db
       .select({ valor: schema.despesas.valor })
       .from(schema.despesas)
-      .where(sql`${schema.despesas.data} >= ${baseTs}`);
-    const totalDespesasDesdeBase = despesasDesdeBase.reduce((s, d) => s + d.valor, 0);
+      .where(sql`${schema.despesas.data} >= ${ANCORA_CC_TS}`);
+    const totalDespesasDesdeAnc = despesasDesdeAnc.reduce((s, d) => s + d.valor, 0);
 
-    saldoContaCorrente = Math.round((saldoBaseEfetivo + receitasDesdeBase - totalDespesasDesdeBase) * 100) / 100;
+    saldoContaCorrente = Math.round(
+      (SALDO_DEFAULTS.saldo_conta_corrente + receitasQuotasBD + creditosBancariosCC - totalDespesasDesdeAnc) * 100
+    ) / 100;
+
+    console.log(
+      `[recalcularSaldos] CC: base=${SALDO_DEFAULTS.saldo_conta_corrente}€ ` +
+      `+quotasBD=${receitasQuotasBD.toFixed(2)}€ +bancarioCC=${creditosBancariosCC.toFixed(2)}€ ` +
+      `-despesas=${totalDespesasDesdeAnc.toFixed(2)}€ = ${saldoContaCorrente}€`
+    );
+
     await upsertSaldo("saldo_conta_corrente", saldoContaCorrente);
   } catch (e) {
     console.error("[recalcularSaldos] saldo_conta_corrente:", e);
@@ -1116,9 +1175,13 @@ export const dashboard = new Hono()
     // saldo_operacional_disponivel persiste em configuracoes via recalcularSaldos().
     // No GET, calculamos inline para garantir frescura mesmo sem sync recente.
     // Cativos CRDT comprometem a conta mas não são despesas.
-    // Débitos DBIT (amount<0) reduzem o saldo mas ainda não estão categorizados.
+    // Débitos DBIT (amount<0) não categorizados APÓS a âncora CC (15/06/2026) ainda não
+    // estão incluídos em despesas na DB → deduzir. Débitos anteriores já estão no saldo base.
+    const totalDebitosBancariosAposAncora = debitosBancariosNaoCategorizados
+      .filter(d => d.date.getTime() >= ANCORA_CC.getTime())
+      .reduce((s, d) => s + d.amount, 0);
     const saldoOperacionalDisponivel = Math.round(
-      (saldos.saldo_conta_corrente - cativos.totalCativos - totalDebitosBancariosGlobal) * 100
+      (saldos.saldo_conta_corrente - cativos.totalCativos - Math.round(totalDebitosBancariosAposAncora * 100) / 100) * 100
     ) / 100;
 
     // ===== PORTÃO GARAGEM e QUOTA EXTRA — derivados do extrasSecoes (100% dinâmico) =====
