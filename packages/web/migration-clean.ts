@@ -11,48 +11,51 @@
  *   • quotas com (ano < 2026) OU (ano = 2026 AND mes < 6) → DELETE
  *   • bank_transactions com date < unix(2026-06-02) → DELETE
  *
- * Execute com:
- *   cd packages/web && bun run ../../migration-clean.ts
- * ou diretamente:
- *   bun migration-clean.ts  (na raiz do repo)
+ * Execute a partir da raiz do repo (o Bun lê o .env de packages/web):
+ *   cd packages/web && bun migration-clean.ts
+ *
+ * O Bun carrega automaticamente o .env da pasta de trabalho corrente.
  *
  * AVISO: operação irreversível. Fazer backup da DB antes se necessário.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-import { drizzle } from "drizzle-orm/better-sqlite3";
-import Database from "better-sqlite3";
-import { and, lt, or, sql, eq, lte } from "drizzle-orm";
-import * as schema from "./packages/web/src/api/database/schema";
-import path from "node:path";
+import { drizzle } from "drizzle-orm/libsql";
+import { createClient } from "@libsql/client";
+import { and, lt, or, sql, eq } from "drizzle-orm";
+import * as schema from "./src/api/database/schema";
 
-// ── Localizar a DB (SQLite) ───────────────────────────────────────────────────
-// Prioridade: env var DATABASE_URL, depois caminho padrão do stack
-const DB_PATH =
-  process.env.DATABASE_URL?.replace("file:", "") ??
-  path.join(import.meta.dir, "packages", "web", "data", "condominio.db");
+const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_AUTH_TOKEN = process.env.DATABASE_AUTH_TOKEN;
 
-console.log(`\n[migration-clean] A ligar a: ${DB_PATH}`);
+if (!DATABASE_URL) {
+  console.error("[migration-clean] ERRO: DATABASE_URL não definido.");
+  console.error("  Cria o ficheiro packages/web/.env com DATABASE_URL e DATABASE_AUTH_TOKEN");
+  console.error("  e executa: cd packages/web && bun migration-clean.ts");
+  process.exit(1);
+}
 
-const sqlite = new Database(DB_PATH);
-const db = drizzle(sqlite, { schema });
+console.log(`\n[migration-clean] A ligar a: ${DATABASE_URL}`);
+
+const client = createClient({
+  url: DATABASE_URL,
+  authToken: DATABASE_AUTH_TOKEN,
+});
+
+const db = drizzle(client, { schema });
 
 // ── Data-âncora: 02/06/2026 ───────────────────────────────────────────────────
-// Quotas com ano/mes anteriores a Junho 2026 são seeds de teste.
-// bank_transactions com date < este timestamp são dados QA.
 const ANCORA_TS = Math.floor(new Date("2026-06-02T00:00:00.000Z").getTime() / 1000);
 
 async function main() {
   // ── 1. Contar antes ─────────────────────────────────────────────────────────
-  const [{ total: totalQuotasAntes }] = db
+  const [{ total: totalQuotasAntes }] = await db
     .select({ total: sql<number>`count(*)` })
-    .from(schema.quotas)
-    .all() as any;
+    .from(schema.quotas);
 
-  const [{ total: totalBankAntes }] = db
+  const [{ total: totalBankAntes }] = await db
     .select({ total: sql<number>`count(*)` })
-    .from(schema.bankTransactions)
-    .all() as any;
+    .from(schema.bankTransactions);
 
   console.log(`\n[migration-clean] Antes da purga:`);
   console.log(`  quotas total:            ${totalQuotasAntes}`);
@@ -60,7 +63,7 @@ async function main() {
 
   // ── 2. Purgar quotas pré-Junho-2026 ─────────────────────────────────────────
   // Condição: (ano < 2026) OR (ano = 2026 AND mes < 6)
-  const deletedQuotas = db
+  const deletedQuotas = await db
     .delete(schema.quotas)
     .where(
       or(
@@ -69,37 +72,33 @@ async function main() {
           eq(schema.quotas.ano, 2026),
           lt(schema.quotas.mes, 6),
         ),
-      )!
-    )
-    .run();
+      )
+    );
 
-  console.log(`\n[migration-clean] ✅ Quotas eliminadas: ${deletedQuotas.changes}`);
+  console.log(`\n[migration-clean] ✅ Quotas eliminadas: ${(deletedQuotas as any)?.rowsAffected ?? "n/a"}`);
 
   // ── 3. Purgar bank_transactions pré-02/06/2026 ──────────────────────────────
-  const deletedBank = db
+  const deletedBank = await db
     .delete(schema.bankTransactions)
-    .where(sql`${schema.bankTransactions.date} < ${ANCORA_TS}`)
-    .run();
+    .where(sql`${schema.bankTransactions.date} < ${ANCORA_TS}`);
 
-  console.log(`[migration-clean] ✅ bank_transactions eliminadas: ${deletedBank.changes}`);
+  console.log(`[migration-clean] ✅ bank_transactions eliminadas: ${(deletedBank as any)?.rowsAffected ?? "n/a"}`);
 
   // ── 4. Contar depois ────────────────────────────────────────────────────────
-  const [{ total: totalQuotasDepois }] = db
+  const [{ total: totalQuotasDepois }] = await db
     .select({ total: sql<number>`count(*)` })
-    .from(schema.quotas)
-    .all() as any;
+    .from(schema.quotas);
 
-  const [{ total: totalBankDepois }] = db
+  const [{ total: totalBankDepois }] = await db
     .select({ total: sql<number>`count(*)` })
-    .from(schema.bankTransactions)
-    .all() as any;
+    .from(schema.bankTransactions);
 
   console.log(`\n[migration-clean] Depois da purga:`);
   console.log(`  quotas total:            ${totalQuotasDepois}`);
   console.log(`  bank_transactions total: ${totalBankDepois}`);
   console.log(`\n[migration-clean] ✅ Concluído — base de dados limpa de seeds antigos.\n`);
 
-  sqlite.close();
+  await client.close();
 }
 
 main().catch((e) => {
