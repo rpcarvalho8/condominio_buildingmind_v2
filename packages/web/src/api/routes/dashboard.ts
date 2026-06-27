@@ -21,6 +21,12 @@ import {
   TOTAL_FRACOES,
   MATRIZ_PROPRIEDADES,
 } from "../lib/identity-matrix";
+import {
+  CARTAS_JULHO_2026,
+  getCartaFracao,
+  totalGeralCartas,
+  morososPorRubrica,
+} from "../lib/cartas-julho-2026";
 
 // ─────────────────────────────────────────────────────────
 // DADOS REAIS DO EXCEL — devedores por conta
@@ -883,55 +889,40 @@ export interface DividaFracao {
   elevadores: number;
 }
 
+/**
+ * calcularDividasIndividuais
+ * ────────────────────────────────────────────────────────────────────────────
+ * FONTE DE VERDADE: cartas de cobrança emitidas (CARTAS_JULHO_2026).
+ * Substituiu o cálculo teórico permilagem × orçamento que gerava 62.264€
+ * para frações que nunca receberam cobrança de extras.
+ *
+ * Retorna apenas as frações COM carta emitida e dívidas > 0.
+ * Frações sem carta = em dia = não constam no resultado.
+ *
+ * Regra de amortização (após pagamentos recebidos):
+ *   Regra A — descritor explícito → débito directo à rubrica nomeada.
+ *   Regra B — genérico: 1.º CC → 2.º FR → 3.º Obras/Motor/Incêndio.
+ *
+ * Nota: neste momento não deduzimos pagamentos pós-carta da DB porque:
+ *   a) os pagamentos são registados pelo motor matricial em quotas.tipo='condominio'
+ *   b) a cascata de amortização (processarCascataAmortizacao) actualiza as gavetas
+ *   c) as cartas são o snapshot de dívida emitido — pagamentos posteriores são tracked
+ *      separadamente via quotas+bank_transactions
+ */
 export async function calcularDividasIndividuais(): Promise<Record<string, DividaFracao>> {
-  // Buscar todos os pagamentos processados com rubrica_extra preenchida.
-  // bank_transactions não tem fracaoId diretamente — fazemos join via importRefId → quotas.id → quotas.fracaoId.
-  // Também incluímos transações onde a fração pode ser inferida via debtorIban (futuro).
-  const pagamentos = await db.select({
-    fracaoId:     schema.quotas.fracaoId,
-    fracaoNumero: schema.fracoes.numero,
-    rubricaExtra: schema.bankTransactions.rubricaExtra,
-    amount:       schema.bankTransactions.amount,
-  })
-  .from(schema.bankTransactions)
-  .innerJoin(schema.quotas, eq(schema.bankTransactions.importRefId, schema.quotas.id))
-  .innerJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
-  .where(and(
-    eq(schema.bankTransactions.imported, 1),
-    eq(schema.bankTransactions.status, "processed"),
-    sql`${schema.bankTransactions.amount} > 0`,
-    sql`${schema.bankTransactions.rubricaExtra} IS NOT NULL`,
-    sql`${schema.bankTransactions.rubricaExtra} != 'CONDOMINIO'`,
-  ));
-
-  // Acumular pagos por idFracao × rubrica
-  type RubricaKey = "OBRAS" | "MOTOR" | "INCENDIO" | "ELEVADORES";
-  const pagoPorFracao = new Map<string, Record<RubricaKey, number>>();
-
-  for (const p of pagamentos) {
-    if (!p.fracaoNumero) continue;
-    const idFracao = p.fracaoNumero.toUpperCase();
-    const rubrica = (p.rubricaExtra ?? "") as RubricaKey;
-    if (!["OBRAS", "MOTOR", "INCENDIO", "ELEVADORES"].includes(rubrica)) continue;
-
-    if (!pagoPorFracao.has(idFracao)) {
-      pagoPorFracao.set(idFracao, { OBRAS: 0, MOTOR: 0, INCENDIO: 0, ELEVADORES: 0 });
-    }
-    pagoPorFracao.get(idFracao)![rubrica] += Math.abs(p.amount ?? 0);
-  }
-
-  // Calcular dívida por fração usando permilagem da MATRIZ
   const resultado: Record<string, DividaFracao> = {};
-  for (const fracao of MATRIZ_PROPRIEDADES) {
-    const id = fracao.idFracao.toUpperCase();
-    const fator = fracao.permilagem / 1000;
-    const pago = pagoPorFracao.get(id) ?? { OBRAS: 0, MOTOR: 0, INCENDIO: 0, ELEVADORES: 0 };
 
+  for (const carta of CARTAS_JULHO_2026) {
+    const id = carta.fracao.toUpperCase();
+    // Só incluir frações com pelo menos uma rubrica em dívida
+    if (carta.obras === 0 && carta.motor === 0 && carta.incendio === 0 && carta.quotasCC_atraso === 0) {
+      continue;
+    }
     resultado[id] = {
-      obras:      Math.max(0, Math.round((ORCAMENTO_OBRAS      * fator - pago.OBRAS)      * 100) / 100),
-      motor:      Math.max(0, Math.round((ORCAMENTO_MOTOR      * fator - pago.MOTOR)      * 100) / 100),
-      incendio:   Math.max(0, Math.round((ORCAMENTO_INCENDIO   * fator - pago.INCENDIO)   * 100) / 100),
-      elevadores: Math.max(0, Math.round((ORCAMENTO_ELEVADORES * fator - pago.ELEVADORES) * 100) / 100),
+      obras:      Math.round(carta.obras    * 100) / 100,
+      motor:      Math.round(carta.motor    * 100) / 100,
+      incendio:   Math.round(carta.incendio * 100) / 100,
+      elevadores: 0, // INDAQUA/elevadores tratados via INDAQUA_DEVEDORES_EXCEL separadamente
     };
   }
 
@@ -1012,10 +1003,9 @@ export const dashboard = new Hono()
     const morosos = Array.from(morososMap.values()).sort((a, b) => b.total - a.total);
     const totalMorosos = morosos.reduce((s, m) => s + m.total, 0);
 
-    // ===== DÍVIDAS INDIVIDUAIS POR PERMILAGEM =====================================
-    // Movidas para o topo do handler — devem estar inicializadas antes de qualquer
-    // bloco que as consuma (obras, motor, incêndio, elevadores).
-    // Fix: ReferenceError TDZ (dividasIndividuais usada antes de declaração).
+    // ===== DÍVIDAS INDIVIDUAIS — FONTE: CARTAS DE COBRANÇA EMITIDAS ==========
+    // calcularDividasIndividuais() usa CARTAS_JULHO_2026 como fonte de verdade.
+    // Nunca usa permilagem × orçamento (gerava 62.264€ incorrectamente).
     let dividasIndividuais: Record<string, DividaFracao> = {};
     try {
       dividasIndividuais = await calcularDividasIndividuais();
@@ -1024,35 +1014,25 @@ export const dashboard = new Hono()
     }
 
     // ===== SECÇÃO: OBRAS =====
-    // Fonte primária: dividasIndividuais (permilagem × ORCAMENTO_OBRAS − pago via bank_transactions)
-    // Fallback: fracoes.obras_divida > 0 (seeded do Excel) → quotas table
-    const hasDividasIndividuais = Object.keys(dividasIndividuais).length > 0;
+    // Fonte: CARTAS_JULHO_2026 (valores reais emitidos nas cartas de cobrança)
+    // Fallback (sem cartas): fracoes.obras_divida (seeded do Excel)
+    const cartasMorosos = morososPorRubrica();
 
     let obrasEmAtraso: Array<{ fracao: any; quotas: any[]; total: number }>;
     let totalObrasAtraso: number;
 
-    if (hasDividasIndividuais) {
-      // Fonte permilagem — buscar dados de display das frações
-      const allFracoesDisplay = await db.select({
-        id: schema.fracoes.id,
-        numero: schema.fracoes.numero,
-        proprietarioNome: schema.fracoes.proprietarioNome,
-        andar: schema.fracoes.andar,
-      }).from(schema.fracoes).where(eq(schema.fracoes.ativo, true));
-
-      obrasEmAtraso = allFracoesDisplay
-        .filter(f => (dividasIndividuais[f.numero.toUpperCase()]?.obras ?? 0) > 0)
-        .map(f => ({
-          fracao: {
-            id: f.numero,
-            numero: f.numero,
-            proprietarioNome: f.proprietarioNome ?? "",
-            andar: f.andar ?? 0,
-          },
-          total: dividasIndividuais[f.numero.toUpperCase()].obras,
-          quotas: [],
-        }))
-        .sort((a, b) => b.total - a.total);
+    if (cartasMorosos.obras.length > 0) {
+      // Fonte cartas — usar dados da carta directamente
+      obrasEmAtraso = cartasMorosos.obras.map(m => ({
+        fracao: {
+          id: m.fracao,
+          numero: m.fracao,
+          proprietarioNome: m.proprietario,
+          andar: 0,
+        },
+        total: m.total,
+        quotas: [],
+      }));
       totalObrasAtraso = Math.round(obrasEmAtraso.reduce((s, m) => s + m.total, 0) * 100) / 100;
     } else {
       // Fallback: fracoes.obras_divida (seeded do Excel)
@@ -1300,28 +1280,12 @@ export const dashboard = new Hono()
       : Math.round((707.25 - portaoAReceberDinamico) * 100) / 100;
 
     // --- INDAQUA + ELEVADORES (Quota Extra) ---
-    // Fonte primária: dividasIndividuais[idFracao].elevadores (permilagem × ORCAMENTO_ELEVADORES − pago)
-    // Fallback: INDAQUA_DEVEDORES_EXCEL − quem pagou na DB
+    // Fonte: INDAQUA_DEVEDORES_EXCEL − quem pagou na DB
+    // (As cartas de julho não incluem dívida INDAQUA separada — ainda usamos Excel para esta gaveta)
     let quotaExtraMorososDinamico: Array<{ fracao: any; quotas: any[]; total: number }>;
     let quotaExtraAReceberDinamico: number;
 
-    if (hasDividasIndividuais) {
-      const allFracoesElev = await db.select({
-        numero: schema.fracoes.numero,
-        proprietarioNome: schema.fracoes.proprietarioNome,
-        andar: schema.fracoes.andar,
-      }).from(schema.fracoes).where(eq(schema.fracoes.ativo, true));
-
-      quotaExtraMorososDinamico = allFracoesElev
-        .filter(f => (dividasIndividuais[f.numero.toUpperCase()]?.elevadores ?? 0) > 0)
-        .map(f => ({
-          fracao: { id: f.numero, numero: f.numero, proprietarioNome: f.proprietarioNome ?? "", andar: f.andar ?? 0 },
-          total: dividasIndividuais[f.numero.toUpperCase()].elevadores,
-          quotas: [],
-        }))
-        .sort((a, b) => b.total - a.total);
-      quotaExtraAReceberDinamico = Math.round(quotaExtraMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
-    } else {
+    {
       const elevPagosRows = await db
         .select({ numero: schema.fracoes.numero })
         .from(schema.quotas)
@@ -1333,26 +1297,17 @@ export const dashboard = new Hono()
     }
 
     // --- MOTOR GARAGEM ---
-    // Fonte primária: dividasIndividuais[idFracao].motor (permilagem × ORCAMENTO_MOTOR − pago)
-    // Fallback: fracoes.motor_divida > 0 → MOTOR_DEVEDORES_EXCEL
+    // Fonte: CARTAS_JULHO_2026 (valores reais emitidos nas cartas de cobrança)
+    // Fallback: MOTOR_DEVEDORES_EXCEL se não há cartas com motor
     let motorMorososDinamico: Array<{ fracao: any; quotas: any[]; total: number }>;
     let motorAReceberDinamico: number;
 
-    if (hasDividasIndividuais) {
-      const allFracoesMotor = await db.select({
-        numero: schema.fracoes.numero,
-        proprietarioNome: schema.fracoes.proprietarioNome,
-        andar: schema.fracoes.andar,
-      }).from(schema.fracoes).where(eq(schema.fracoes.ativo, true));
-
-      motorMorososDinamico = allFracoesMotor
-        .filter(f => (dividasIndividuais[f.numero.toUpperCase()]?.motor ?? 0) > 0)
-        .map(f => ({
-          fracao: { id: f.numero, numero: f.numero, proprietarioNome: f.proprietarioNome ?? "", andar: f.andar ?? 0 },
-          total: dividasIndividuais[f.numero.toUpperCase()].motor,
-          quotas: [],
-        }))
-        .sort((a, b) => b.total - a.total);
+    if (cartasMorosos.motor.length > 0) {
+      motorMorososDinamico = cartasMorosos.motor.map(m => ({
+        fracao: { id: m.fracao, numero: m.fracao, proprietarioNome: m.proprietario, andar: 0 },
+        total: m.total,
+        quotas: [],
+      }));
       motorAReceberDinamico = Math.round(motorMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
     } else {
       const motorDividaBD = await db.select({
@@ -1370,26 +1325,17 @@ export const dashboard = new Hono()
     }
 
     // --- INCÊNDIO ---
-    // Fonte primária: dividasIndividuais[idFracao].incendio (permilagem × ORCAMENTO_INCENDIO − pago)
+    // Fonte: CARTAS_JULHO_2026 (valores reais emitidos nas cartas de cobrança)
     // Fallback: INCENDIO_DEVEDORES_EXCEL − quem pagou na DB
     let incendioMorososDinamico: Array<{ fracao: any; quotas: any[]; total: number }>;
     let incendioAReceberDinamico: number;
 
-    if (hasDividasIndividuais) {
-      const allFracoesInc = await db.select({
-        numero: schema.fracoes.numero,
-        proprietarioNome: schema.fracoes.proprietarioNome,
-        andar: schema.fracoes.andar,
-      }).from(schema.fracoes).where(eq(schema.fracoes.ativo, true));
-
-      incendioMorososDinamico = allFracoesInc
-        .filter(f => (dividasIndividuais[f.numero.toUpperCase()]?.incendio ?? 0) > 0)
-        .map(f => ({
-          fracao: { id: f.numero, numero: f.numero, proprietarioNome: f.proprietarioNome ?? "", andar: f.andar ?? 0 },
-          total: dividasIndividuais[f.numero.toUpperCase()].incendio,
-          quotas: [],
-        }))
-        .sort((a, b) => b.total - a.total);
+    if (cartasMorosos.incendio.length > 0) {
+      incendioMorososDinamico = cartasMorosos.incendio.map(m => ({
+        fracao: { id: m.fracao, numero: m.fracao, proprietarioNome: m.proprietario, andar: 0 },
+        total: m.total,
+        quotas: [],
+      }));
       incendioAReceberDinamico = Math.round(incendioMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
     } else {
       const incPagosRows = await db
@@ -1429,14 +1375,13 @@ export const dashboard = new Hono()
       },
       obras: {
         totalPago: totalObrasPago,
-        // Fonte primária: dividasIndividuais (permilagem × orcamento − pago via rubrica_extra)
-        // Fallback: fracoes.obras_divida (seeded do Excel) → configuracoes
+        // Fonte: cartas de cobrança emitidas (CARTAS_JULHO_2026)
         totalAtraso: totalObrasAtraso,
         totalTotal: totalObrasTotal,
         fracoesEmAtraso: obrasEmAtraso.length,
         morosos: obrasEmAtraso,
         saldoConta: saldos.saldo_obras,
-        fonteDados: hasDividasIndividuais ? "permilagem" : "excel",
+        fonteDados: cartasMorosos.obras.length > 0 ? "cartas" : "excel",
       },
       extras: extrasSecoes,
       fundoReserva: {
@@ -1445,30 +1390,27 @@ export const dashboard = new Hono()
         morosos: FUNDO_RESERVA_DEVEDORES_EXCEL,
       },
       incendio: {
-        // Fonte primária: dividasIndividuais[idFracao].incendio
-        // Fallback: INCENDIO_DEVEDORES_EXCEL − DB pagos
+        // Fonte: cartas de cobrança emitidas (CARTAS_JULHO_2026)
         saldoConta: saldos.saldo_incendio,
         aReceber: incendioAReceberDinamico,
         fracoesEmAtraso: incendioMorososDinamico.length,
         morosos: incendioMorososDinamico,
-        fonteDados: hasDividasIndividuais ? "permilagem" : "excel",
+        fonteDados: cartasMorosos.incendio.length > 0 ? "cartas" : "excel",
       },
       quotaExtra: {
-        // Fonte primária: dividasIndividuais[idFracao].elevadores
-        // Fallback: INDAQUA_DEVEDORES_EXCEL − DB pagos
+        // Fonte: INDAQUA_DEVEDORES_EXCEL − DB pagos (cartas não desagregam INDAQUA)
         saldoConta: saldos.saldo_quota_extra,
         aReceber: quotaExtraAReceberDinamico,
         fracoesEmAtraso: quotaExtraMorososDinamico.length,
         morosos: quotaExtraMorososDinamico,
-        fonteDados: hasDividasIndividuais ? "permilagem" : "excel",
+        fonteDados: "excel",
       },
       motor: {
-        // Fonte primária: dividasIndividuais[idFracao].motor
-        // Fallback: fracoes.motor_divida → MOTOR_DEVEDORES_EXCEL
+        // Fonte: cartas de cobrança emitidas (CARTAS_JULHO_2026)
         aReceber: motorAReceberDinamico,
         fracoesEmAtraso: motorMorososDinamico.length,
         morosos: motorMorososDinamico,
-        fonteDados: hasDividasIndividuais ? "permilagem" : "excel",
+        fonteDados: cartasMorosos.motor.length > 0 ? "cartas" : "excel",
       },
       portaoGaragem: {
         saldoConta: saldos.saldo_portao,
@@ -1481,8 +1423,11 @@ export const dashboard = new Hono()
       // Pagamentos bancários confirmados mas NÃO categorizados no Excel pelo condomínio
       // Estes criam discrepâncias entre o que o Excel mostra e a realidade bancária
       pagamentosNaoRegistados: PAGAMENTOS_NAO_CATEGORIZADOS,
-      // Mapa completo de dívidas por fração por rubrica (permilagem)
+      // Mapa completo de dívidas por fração por rubrica (fonte: cartas de cobrança)
       dividasIndividuais,
+      // Total "Por Receber" real = soma dos totalCarta emitidos
+      totalGeralCartas: totalGeralCartas(),
+      fonteDividasGlobal: "cartas-julho-2026",
 
       // ── SALDO OPERACIONAL (nova gaveta de topo) ─────────────────────────────
       // saldoContaCorrenteTotal   = saldo físico Conta à Ordem (inclui cativos)
