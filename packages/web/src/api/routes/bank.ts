@@ -14,7 +14,7 @@ import { Hono } from "hono";
 import { requireAdmin } from "../middleware/auth";
 import { db } from "../database";
 import * as schema from "../database/schema";
-import { eq, desc, and } from "drizzle-orm";
+import { eq, desc, and, sql } from "drizzle-orm";
 import crypto from "node:crypto";
 import { recalcularSaldos } from "./dashboard";
 import { identifyByMultiMatch, processarCascataAmortizacao, learnIBAN } from "../lib/identity-matrix";
@@ -1129,18 +1129,61 @@ export async function runBankSync(): Promise<void> {
   }
 
   let importResults = { despesasCreated: 0, quotasCreated: 0, quotasUpdated: 0, despesasSkipped: 0, staged: 0, stagingSkipped: 0, errors: [] as string[] };
-  if (allTransactions.length > 0) {
-    importResults = await importTransactions(allTransactions, connection.id);
-  }
 
-  try {
-    await recalcularSaldos();
-  } catch (e: any) {
-    console.error("[bank-cron] Erro ao recalcular saldos:", e.message);
+  // ── CAMADA DE CONTINGÊNCIA (Offline Fallback) ─────────────────────────────
+  // Se o Enable Banking falhou em TODOS os chunks (rede cortada, token expirado,
+  // consentimento revogado), allTransactions fica vazio mas pode haver transações
+  // já em staging (imported=0) na BD — resultado de syncs parciais anteriores.
+  // Nesse caso NÃO abortamos: avançamos com o que já está na BD local.
+  const bancoOffline = allTransactions.length === 0 && syncErrors.length > 0;
+
+  if (bancoOffline) {
+    // Contar quantas transações pendentes existem em staging
+    const [{ pendentes }] = await db
+      .select({ pendentes: sql<number>`count(*)` })
+      .from(schema.bankTransactions)
+      .where(eq(schema.bankTransactions.imported, 0));
+
+    console.warn(
+      `[bank-cron] ⚠️  Enable Banking offline — modo fallback activado.` +
+      ` ${pendentes} transações pendentes em staging serão processadas sem nova ingestão.`
+    );
+
+    // Registar o motivo da falha como aviso (não erro bloqueante)
+    syncErrors.forEach(e =>
+      console.warn(`[bank-cron] [offline-reason] ${e}`)
+    );
+
+    // Não corremos importTransactions (sem dados novos do banco).
+    // Não corremos recalcularSaldos ANTES de processarStagedTransactions —
+    // fazê-lo agora reporia os orçamentos brutos sem considerar os pagamentos
+    // em staging, corrompendo as rubricas no ecrã.
+    // O recalcularSaldos será executado dentro de processarStagedTransactions()
+    // após processar as transações pendentes (comportamento normal da Camada 2).
+  } else if (allTransactions.length > 0) {
+    // Fluxo normal: ingerir transações recebidas do banco
+    importResults = await importTransactions(allTransactions, connection.id);
+
+    // Recalcular saldos após ingestão e antes da Camada 2 LLM
+    try {
+      await recalcularSaldos();
+    } catch (e: any) {
+      console.error("[bank-cron] Erro ao recalcular saldos:", e.message);
+    }
+  }
+  // Caso sem erros E sem transações (banco vazio no período): comportamento
+  // normal, recalcular saldos para reflectir o estado actual.
+  else {
+    try {
+      await recalcularSaldos();
+    } catch (e: any) {
+      console.error("[bank-cron] Erro ao recalcular saldos:", e.message);
+    }
   }
 
   // ── Camada 2: LLM Fallback sobre TXNs em staging ─────────────────────────
-  // Processa todas as transações que ficaram imported=0 após o motor matricial.
+  // Corre sempre — processa transações imported=0 quer venham de nova ingestão
+  // quer já existissem em staging de syncs anteriores (modo offline-fallback).
   let llmProcessed = 0;
   let llmManualReview = 0;
   const llmProviderCounts: Record<string, number> = {};
@@ -1165,15 +1208,17 @@ export async function runBankSync(): Promise<void> {
   }
 
   // ── Log estruturado do ciclo completo ────────────────────────────────────
-  const totalErrors = syncErrors.length + importResults.errors.length;
+  // Em modo offline os syncErrors são avisos, não erros fatais — não somamos
+  // ao totalErrors para não marcar o sync como "partial" por culpa do banco.
+  const totalErrors = (bancoOffline ? 0 : syncErrors.length) + importResults.errors.length;
   const llmProviderSummary = Object.entries(llmProviderCounts)
     .map(([p, n]) => `${p}=${n}`).join(", ");
 
   console.info(
     `\n╔══════════════════════════════════════════════════════════════╗` +
-    `\n║  [bank-cron] SYNC ${new Date().toISOString().slice(0, 16).replace("T", " ")} PT                         ` +
+    `\n║  [bank-cron] SYNC ${new Date().toISOString().slice(0, 16).replace("T", " ")} PT${bancoOffline ? " [OFFLINE-FALLBACK]" : ""}` +
     `\n╠══════════════════════════════════════════════════════════════╣` +
-    `\n║  📥  Transações ingeridas:  ${String(allTransactions.length).padEnd(4)} (${importResults.staged} novas, ${importResults.stagingSkipped} duplicadas)` +
+    `\n║  📥  Transações ingeridas:  ${String(allTransactions.length).padEnd(4)} (${importResults.staged} novas, ${importResults.stagingSkipped} duplicadas)${bancoOffline ? " ← banco offline" : ""}` +
     `\n║  🏦  Barreira 1 (IBAN/Matriz): ${String(importResults.quotasCreated + importResults.quotasUpdated).padEnd(4)} quotas (${importResults.quotasCreated} criadas, ${importResults.quotasUpdated} actualizadas)` +
     `\n║  🤖  Camada 2 LLM:          ${String(llmProcessed).padEnd(4)} identificadas${llmProviderSummary ? ` [${llmProviderSummary}]` : ""}` +
     `\n║  👁️  Revisão manual:         ${String(llmManualReview).padEnd(4)} pendentes` +
@@ -1191,7 +1236,10 @@ export async function runBankSync(): Promise<void> {
     quotasCreated: importResults.quotasCreated + llmProcessed,
     quotasUpdated: importResults.quotasUpdated,
     skipped: importResults.despesasSkipped,
-    errors: JSON.stringify([...syncErrors, ...importResults.errors]),
-    status: totalErrors > 0 ? "partial" : "ok",
+    errors: JSON.stringify([
+      ...(bancoOffline ? syncErrors.map(e => `[offline-warn] ${e}`) : syncErrors),
+      ...importResults.errors,
+    ]),
+    status: totalErrors > 0 ? "partial" : (bancoOffline ? "offline-fallback" : "ok"),
   });
 }
