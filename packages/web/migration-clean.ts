@@ -4,17 +4,21 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * PURGA DE SEEDS ANTIGOS / DADOS QA
  *
- * Remove todos os registos da tabela `quotas` e `bank_transactions` que tenham
- * data anterior a 02 de Junho de 2026 (ANCORA_DATA_MOVIMENTOS).
+ * Remove todos os registos das tabelas `recibos`, `quotas` e `bank_transactions`
+ * com data anterior a 02 de Junho de 2026 (ANCORA_DATA_MOVIMENTOS).
  *
  * Lógica:
+ *   • recibos com (ano < 2026) OU (ano = 2026 AND mes < 6) → DELETE (FK child)
  *   • quotas com (ano < 2026) OU (ano = 2026 AND mes < 6) → DELETE
  *   • bank_transactions com date < unix(2026-06-02) → DELETE
  *
- * Execute a partir da raiz do repo (o Bun lê o .env de packages/web):
- *   cd packages/web && bun migration-clean.ts
+ * Usa PRAGMA foreign_keys = OFF antes dos DELETEs e reativa no final.
+ * Em Turso remoto (HTTP), o PRAGMA é executado via client.batch() para garantir
+ * que corre na mesma sessão SQLite. Como fallback, os recibos dependentes são
+ * apagados antes das quotas (ordem FK-safe).
  *
- * O Bun carrega automaticamente o .env da pasta de trabalho corrente.
+ * Execute a partir de packages/web (o Bun lê o .env local):
+ *   cd packages/web && bun migration-clean.ts
  *
  * AVISO: operação irreversível. Fazer backup da DB antes se necessário.
  * ─────────────────────────────────────────────────────────────────────────────
@@ -47,11 +51,18 @@ const db = drizzle(client, { schema });
 // ── Data-âncora: 02/06/2026 ───────────────────────────────────────────────────
 const ANCORA_TS = Math.floor(new Date("2026-06-02T00:00:00.000Z").getTime() / 1000);
 
+// SQL de filtro temporal reutilizável (ano/mes como inteiros)
+const FILTRO_ANTES_JUNHO_2026 = sql`(ano < 2026 OR (ano = 2026 AND mes < 6))`;
+
 async function main() {
   // ── 1. Contar antes ─────────────────────────────────────────────────────────
   const [{ total: totalQuotasAntes }] = await db
     .select({ total: sql<number>`count(*)` })
     .from(schema.quotas);
+
+  const [{ total: totalRecibosAntes }] = await db
+    .select({ total: sql<number>`count(*)` })
+    .from(schema.recibos);
 
   const [{ total: totalBankAntes }] = await db
     .select({ total: sql<number>`count(*)` })
@@ -59,35 +70,54 @@ async function main() {
 
   console.log(`\n[migration-clean] Antes da purga:`);
   console.log(`  quotas total:            ${totalQuotasAntes}`);
+  console.log(`  recibos total:           ${totalRecibosAntes}`);
   console.log(`  bank_transactions total: ${totalBankAntes}`);
 
-  // ── 2. Purgar quotas pré-Junho-2026 ─────────────────────────────────────────
-  // Condição: (ano < 2026) OR (ano = 2026 AND mes < 6)
-  const deletedQuotas = await db
-    .delete(schema.quotas)
-    .where(
-      or(
-        lt(schema.quotas.ano, 2026),
-        and(
-          eq(schema.quotas.ano, 2026),
-          lt(schema.quotas.mes, 6),
-        ),
-      )
-    );
+  // ── 2. Desativar FK constraints + purgar em batch ────────────────────────────
+  // client.batch() garante execução na mesma sessão SQLite no Turso,
+  // o que é necessário para o PRAGMA foreign_keys ter efeito.
+  console.log(`\n[migration-clean] A desativar foreign_keys e a purgar...`);
 
-  console.log(`\n[migration-clean] ✅ Quotas eliminadas: ${(deletedQuotas as any)?.rowsAffected ?? "n/a"}`);
+  await client.batch(
+    [
+      // 2a. Desativar FK verification
+      { sql: "PRAGMA foreign_keys = OFF;", args: [] },
 
-  // ── 3. Purgar bank_transactions pré-02/06/2026 ──────────────────────────────
-  const deletedBank = await db
-    .delete(schema.bankTransactions)
-    .where(sql`${schema.bankTransactions.date} < ${ANCORA_TS}`);
+      // 2b. Apagar recibos dependentes (FK child de quotas) — por segurança,
+      //     mesmo com PRAGMA OFF, apagamos primeiro para manter consistência
+      {
+        sql: "DELETE FROM recibos WHERE (ano < 2026 OR (ano = 2026 AND mes < 6));",
+        args: [],
+      },
 
-  console.log(`[migration-clean] ✅ bank_transactions eliminadas: ${(deletedBank as any)?.rowsAffected ?? "n/a"}`);
+      // 2c. Apagar quotas antigas
+      {
+        sql: "DELETE FROM quotas WHERE (ano < 2026 OR (ano = 2026 AND mes < 6));",
+        args: [],
+      },
 
-  // ── 4. Contar depois ────────────────────────────────────────────────────────
+      // 2d. Apagar bank_transactions antigas
+      {
+        sql: `DELETE FROM bank_transactions WHERE date < ${ANCORA_TS};`,
+        args: [],
+      },
+
+      // 2e. Reativar FK verification
+      { sql: "PRAGMA foreign_keys = ON;", args: [] },
+    ],
+    "write",
+  );
+
+  console.log(`[migration-clean] ✅ Purga concluída (batch write com FK OFF/ON).`);
+
+  // ── 3. Contar depois ────────────────────────────────────────────────────────
   const [{ total: totalQuotasDepois }] = await db
     .select({ total: sql<number>`count(*)` })
     .from(schema.quotas);
+
+  const [{ total: totalRecibosDepois }] = await db
+    .select({ total: sql<number>`count(*)` })
+    .from(schema.recibos);
 
   const [{ total: totalBankDepois }] = await db
     .select({ total: sql<number>`count(*)` })
@@ -95,6 +125,7 @@ async function main() {
 
   console.log(`\n[migration-clean] Depois da purga:`);
   console.log(`  quotas total:            ${totalQuotasDepois}`);
+  console.log(`  recibos total:           ${totalRecibosDepois}`);
   console.log(`  bank_transactions total: ${totalBankDepois}`);
   console.log(`\n[migration-clean] ✅ Concluído — base de dados limpa de seeds antigos.\n`);
 
@@ -103,5 +134,7 @@ async function main() {
 
 main().catch((e) => {
   console.error("[migration-clean] ERRO:", e);
+  // Tentar reativar FK constraints mesmo em caso de erro
+  client.execute("PRAGMA foreign_keys = ON;").catch(() => {});
   process.exit(1);
 });
