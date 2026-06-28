@@ -429,11 +429,14 @@ async function htmlToPdf(html: string, outPath: string): Promise<void> {
 }
 
 // ─── Core: gerar recibos para mês/ano ────────────────────────────────────────
-export async function gerarRecibosParaMes(mes: number, ano: number): Promise<{
+export async function gerarRecibosParaMes(mes: number, ano: number, opts: {
+  sendEmail?: boolean; // default true (mantém comportamento original); false = só gera PDFs
+} = {}): Promise<{
   gerados: number;
   erros: string[];
   ignorados: number;
 }> {
+  const { sendEmail = true } = opts;
   const erros: string[] = [];
   let gerados = 0;
   let ignorados = 0;
@@ -575,8 +578,9 @@ export async function gerarRecibosParaMes(mes: number, ano: number): Promise<{
       gerados++;
       console.log(`[recibos] Gerado recibo ${numeroRecibo} para fração ${fracao.numero} (${linhas.length} linhas, total €${total.toFixed(2)})`);
 
-      // Auto-send email if proprietario has email
-      if (fracao.proprietarioEmail) {
+      // Auto-send email if proprietario has email AND sendEmail=true
+      // (sendEmail=false: apenas gera PDFs, envio fica para o lote unificado do dia 1)
+      if (sendEmail && fracao.proprietarioEmail) {
         try {
           await enviarReciboEmail({
             para: fracao.proprietarioEmail,
@@ -713,14 +717,17 @@ export const recibosRoutes = new Hono()
     return c.json({ ok: true, enviado_para: recibo.proprietarioEmail });
   });
 
-// ─── Cron: fim de mês ─────────────────────────────────────────────────────────
+// ─── Cron: último dia do mês às 23h59 ───────────────────────────────────────
+// Gera recibos PDF para o mês que termina, sem enviar emails (envio é feito
+// pelo cron de dia 1 como parte do lote unificado recibo+nota de cobrança).
 export function scheduleRecibosCron() {
   function msUntilEndOfMonth(): number {
     const now = new Date();
-    const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 30, 0, 0);
+    // Último dia do mês corrente às 23:59:00
+    const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 0, 0);
     if (lastDay <= now) {
-      // Already past end of this month, schedule for next month
-      const nextLast = new Date(now.getFullYear(), now.getMonth() + 2, 0, 23, 30, 0, 0);
+      // Já passou — agendar para o fim do próximo mês
+      const nextLast = new Date(now.getFullYear(), now.getMonth() + 2, 0, 23, 59, 0, 0);
       return nextLast.getTime() - now.getTime();
     }
     return lastDay.getTime() - now.getTime();
@@ -728,16 +735,17 @@ export function scheduleRecibosCron() {
 
   function scheduleNext() {
     const ms = msUntilEndOfMonth();
-    const minutos = Math.round(ms / 60000);
-    console.log(`[recibos-cron] Próxima geração em ${minutos} min (fim do mês)`);
+    const horas = Math.round(ms / 3600000);
+    console.log(`[recibos-cron] Próxima geração em ${horas}h (último dia do mês às 23:59)`);
     setTimeout(async () => {
       const now = new Date();
       const mes = now.getMonth() + 1;
       const ano = now.getFullYear();
-      console.log(`[recibos-cron] A gerar recibos para ${mes}/${ano}...`);
+      console.log(`[recibos-cron] A gerar recibos para ${mes}/${ano} (sem envio de email — aguarda lote dia 1)...`);
       try {
-        const result = await gerarRecibosParaMes(mes, ano);
-        console.log(`[recibos-cron] Gerados: ${result.gerados}, Erros: ${result.erros.length}`);
+        // sendEmail=false: apenas gera os PDFs, o envio fica para o cron de dia 1
+        const result = await gerarRecibosParaMes(mes, ano, { sendEmail: false });
+        console.log(`[recibos-cron] Gerados: ${result.gerados}, Ignorados: ${result.ignorados}, Erros: ${result.erros.length}`);
       } catch (e) {
         console.error("[recibos-cron] Erro:", e);
       }

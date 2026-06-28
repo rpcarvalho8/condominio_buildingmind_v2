@@ -704,31 +704,142 @@ export const avisosRoutes = new Hono()
     });
   });
 
-// ─── Cron: 1º dia do mês às 08:00 ────────────────────────────────────────────
-export function scheduleAvisosCron() {
-  function msUntilFirstOfMonth(): number {
-    const now = new Date();
-    const firstNext = new Date(now.getFullYear(), now.getMonth() + 1, 1, 8, 0, 0, 0);
-    return firstNext.getTime() - now.getTime();
-  }
+// ─── Lote Unificado: Recibo + Nota de Cobrança ──────────────────────────────
+// Enviado no dia 1 de cada mês às 00h00 como parte do fecho mensal automático.
+// Envia por email para cada fração:
+//   1. Recibo do mês que terminou (mes anterior)
+//   2. Nota de cobrança do mês que começa (mes actual)
+// Retorna contagem de envios e erros.
+export async function enviarLoteUnificado(
+  mesRecibo: number,   // mês que terminou (ex: 6 para Junho)
+  anoRecibo: number,   // ano do recibo (ex: 2026)
+  mesCobranca: number, // mês que começa (ex: 7 para Julho)
+  anoCobranca: number, // ano da nota de cobrança (ex: 2026)
+): Promise<{ enviados: number; erros: string[] }> {
+  const erros: string[] = [];
+  let enviados = 0;
 
-  function scheduleNext() {
-    const ms = msUntilFirstOfMonth();
-    console.log(`[avisos-cron] Próximos avisos em ${Math.round(ms / 60000)} min`);
-    setTimeout(async () => {
-      const now = new Date();
-      const mes = now.getMonth() + 1;
-      const ano = now.getFullYear();
-      console.log(`[avisos-cron] Gerando avisos ${mes}/${ano}...`);
-      try {
-        const r = await gerarAvisosCobranca(mes, ano, { sendEmail: true });
-        console.log(`[avisos-cron] Gerados: ${r.gerados}, Erros: ${r.erros.length}`);
-      } catch (e) {
-        console.error("[avisos-cron] Erro:", e);
+  // Buscar fracões activas com email
+  const fracoesList = await db
+    .select()
+    .from(schema.fracoes)
+    .where(eq(schema.fracoes.ativo, true));
+
+  // Pré-carregar recibos gerados para o mês anterior
+  const recibosRows = await db
+    .select({
+      fracaoId: schema.recibos.fracaoId,
+      numeroRecibo: schema.recibos.numeroRecibo,
+      pdfUrl: schema.recibos.pdfUrl,
+      valor: schema.recibos.valor,
+    })
+    .from(schema.recibos)
+    .where(and(
+      eq(schema.recibos.mes, mesRecibo),
+      eq(schema.recibos.ano, anoRecibo),
+    ));
+  const recibosByFracao = new Map(recibosRows.map(r => [r.fracaoId, r]));
+
+  // Pré-carregar avisos gerados para o mês de cobrança
+  // Os ficheiros estão em data/avisos/aviso_{ano}_{mes}_{fracao}.pdf
+  const avisoDir = path.join(process.cwd(), "data", "avisos");
+  const RECIBOS_PDF_DIR = path.join(process.cwd(), "data", "recibos");
+  const mesStr = String(mesCobranca).padStart(2, "0");
+  const anoStr = String(anoCobranca);
+
+  const mesNomeRecibo = MESES[mesRecibo] ?? String(mesRecibo);
+  const mesNomeCobranca = MESES[mesCobranca] ?? String(mesCobranca);
+
+  for (const fracao of fracoesList) {
+    if (!fracao.proprietarioEmail) continue;
+
+    try {
+      // Encontrar PDF do recibo
+      const reciboRow = recibosByFracao.get(fracao.id);
+      const reciboPdfFilename = reciboRow?.pdfUrl?.split("/").pop();
+      const reciboPdfPath = reciboPdfFilename
+        ? path.join(RECIBOS_PDF_DIR, reciboPdfFilename)
+        : null;
+
+      // Encontrar PDF do aviso (nota de cobrança)
+      const safeFracao = fracao.numero.replace(/[^a-zA-Z0-9]/g, "");
+      const avisoPdfFilename = `aviso_${anoStr}_${mesStr}_${safeFracao}.pdf`;
+      const avisoPdfPath = path.join(avisoDir, avisoPdfFilename);
+
+      const hasRecibo = reciboPdfPath && fs.existsSync(reciboPdfPath);
+      const hasAviso = fs.existsSync(avisoPdfPath);
+
+      if (!hasRecibo && !hasAviso) {
+        // Nada a enviar para esta fração
+        continue;
       }
-      scheduleNext();
-    }, ms);
+
+      // Construir subject e corpo do email
+      const subject = hasRecibo && hasAviso
+        ? `Recibo ${mesNomeRecibo} ${anoRecibo} + Nota de Cobrança ${mesNomeCobranca} ${anoCobranca} — Fração ${fracao.numero}`
+        : hasRecibo
+          ? `Recibo ${mesNomeRecibo} ${anoRecibo} — Fração ${fracao.numero}`
+          : `Nota de Cobrança ${mesNomeCobranca} ${anoCobranca} — Fração ${fracao.numero}`;
+
+      const valorRecibo = reciboRow?.valor ?? 0;
+      const html = `
+        <p>Exmo/a Sr/a. ${fracao.proprietarioNome ?? "Proprietário"},</p>
+        ${hasRecibo ? `<p>Segue em anexo o <strong>Recibo n.º ${reciboRow?.numeroRecibo}</strong> 
+          referente a <strong>${mesNomeRecibo} ${anoRecibo}</strong>, 
+          no valor de <strong>€${valorRecibo.toFixed(2).replace(".", ",")}</strong>.</p>` : ""}
+        ${hasAviso ? `<p>Segue também em anexo a <strong>Nota de Cobrança</strong> 
+          para <strong>${mesNomeCobranca} ${anoCobranca}</strong>. 
+          Solicitamos que proceda ao pagamento até ao dia 10.</p>
+          <p>Meios de pagamento: transferência para o IBAN <strong>${CONDOMINIO.iban}</strong></p>` : ""}
+        <br>
+        <p>Com os melhores cumprimentos,</p>
+        <p><strong>A Administração do Condomínio</strong><br>${CONDOMINIO.nome}</p>
+      `;
+
+      // Escrever HTML para ficheiro temporário
+      const tmpHtml = path.join(avisoDir, `_lote_${Date.now()}_${safeFracao}.html`);
+      fs.writeFileSync(tmpHtml, html, "utf8");
+
+      // Construir argumentos --attach
+      const attachArgs = [
+        hasRecibo ? `--attach "${reciboPdfPath}"` : "",
+        hasAviso  ? `--attach "${avisoPdfPath}"` : "",
+      ].filter(Boolean).join(" ");
+
+      const subjectEscaped = subject.replace(/"/g, '\\"');
+      const cmd = `cat "${tmpHtml}" | send-email --to "${fracao.proprietarioEmail}" --subject "${subjectEscaped}" --html - ${attachArgs}`;
+
+      await new Promise<void>((resolve, reject) => {
+        exec(cmd, (err, _stdout, stderr) => {
+          fs.unlinkSync(tmpHtml);
+          if (err) reject(new Error(stderr || err.message));
+          else resolve();
+        });
+      });
+
+      // Marcar recibo como enviado
+      if (hasRecibo && reciboRow?.numeroRecibo) {
+        await db.update(schema.recibos)
+          .set({ enviadoEmail: true })
+          .where(eq(schema.recibos.fracaoId, fracao.id));
+      }
+
+      enviados++;
+      console.log(`[lote-unificado] Enviado para ${fracao.proprietarioEmail} (fração ${fracao.numero})`);
+    } catch (err: any) {
+      const msg = `Fração ${fracao.numero}: ${err?.message ?? err}`;
+      erros.push(msg);
+      console.error("[lote-unificado] Erro:", msg);
+    }
   }
 
-  scheduleNext();
+  return { enviados, erros };
+}
+
+// ─── Cron: 1º dia do mês às 08:00 (legado — substituído pelo cron coordenado em index.ts) ──
+// Mantido apenas como fallback manual. O envio automático é feito pelo cron de 00h00 em index.ts.
+export function scheduleAvisosCron() {
+  // Desactivado — o cron coordenado em index.ts gere recibos+avisos como lote unificado.
+  // Este cron foi substituído pelo scheduleTransicaoMensalCron().
+  console.log("[avisos-cron] Substituído pelo cron de transição mensal (scheduleTransicaoMensalCron).");
 }

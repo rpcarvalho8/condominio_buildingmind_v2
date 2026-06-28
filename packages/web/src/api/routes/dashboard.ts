@@ -1021,11 +1021,32 @@ export async function calcularDividasIndividuais(): Promise<Record<string, Divid
   return resultado;
 }
 
+// ─── Regra de Visibilidade de Faturação ──────────────────────────────────────
+// Os dados de dívida e "por receber" de um dado mês/ano SÓ são visíveis
+// a partir do dia 1 desse mês (00h00 UTC+0). Até lá o dashboard mantém-se
+// focado no mês corrente — as cartas do próximo mês ficam ocultas no backend.
+//
+// Uso: faturacaoMesVisivel(7, 2026) → true se hoje >= 2026-07-01T00:00:00Z
+export function faturacaoMesVisivel(mes: number, ano: number): boolean {
+  const agora = Date.now();
+  const gatilho = new Date(ano, mes - 1, 1, 0, 0, 0, 0).getTime(); // dia 1 mês, 00h00 local
+  return agora >= gatilho;
+}
+
 export const dashboard = new Hono()
   .get("/", async (c) => {
     const agora = new Date();
     const mesAtual = agora.getMonth() + 1;
     const anoAtual = agora.getFullYear();
+
+    // ── Gatilho de visibilidade para o mês de faturação actual ───────────────
+    // Se ainda não chegámos ao dia 1 do mês das cartas (ex: Julho 2026),
+    // o payload omite os dados de dívida das cartas e marca faturacaoVisivel=false.
+    // Quando faturacaoVisivel=true, todos os dados de cartas são expostos normalmente.
+    // NOTA: as CARTAS_JULHO_2026 são de Julho → mês 7, ano 2026.
+    const CARTAS_MES = 7;
+    const CARTAS_ANO = 2026;
+    const faturacaoVisivel = faturacaoMesVisivel(CARTAS_MES, CARTAS_ANO);
 
     // Total frações ativas
     const fracaoCountRows = await db
@@ -1102,17 +1123,25 @@ export const dashboard = new Hono()
     // ===== DÍVIDAS INDIVIDUAIS — FONTE: CARTAS DE COBRANÇA EMITIDAS ==========
     // calcularDividasIndividuais() usa CARTAS_JULHO_2026 como fonte de verdade.
     // Nunca usa permilagem × orçamento (gerava 62.264€ incorrectamente).
+    // Gatilho dia 1: se faturacaoVisivel=false, retorna mapa vazio (cartas ainda ocultas).
     let dividasIndividuais: Record<string, DividaFracao> = {};
-    try {
-      dividasIndividuais = await calcularDividasIndividuais();
-    } catch (e) {
-      console.warn("[dashboard] calcularDividasIndividuais falhou:", e);
+    if (faturacaoVisivel) {
+      try {
+        dividasIndividuais = await calcularDividasIndividuais();
+      } catch (e) {
+        console.warn("[dashboard] calcularDividasIndividuais falhou:", e);
+      }
     }
 
     // ===== SECÇÃO: OBRAS =====
     // Fonte: CARTAS_JULHO_2026 (valores reais emitidos nas cartas de cobrança)
     // Fallback (sem cartas): fracoes.obras_divida (seeded do Excel)
-    const cartasMorosos = morososPorRubrica();
+    // Gatilho dia 1: se faturacaoVisivel=false, morososPorRubrica retorna estrutura vazia
+    //   para que nenhuma rubrica de carta apareça no dashboard antes do dia 1 do mês.
+    const cartasMorososReal = morososPorRubrica();
+    const cartasMorosos = faturacaoVisivel ? cartasMorososReal : {
+      obras: [], motor: [], incendio: [], contaCorrente: [],
+    };
 
     let obrasEmAtraso: Array<{ fracao: any; quotas: any[]; total: number }>;
     let totalObrasAtraso: number;
@@ -1618,8 +1647,15 @@ export const dashboard = new Hono()
       // Mapa completo de dívidas por fração por rubrica (fonte: cartas de cobrança)
       dividasIndividuais,
       // Total "Por Receber" real = soma dos totalCarta emitidos
-      totalGeralCartas: totalGeralCartas(),
+      // Oculto até ao dia 1 do mês de faturação (gatilho de visibilidade)
+      totalGeralCartas: faturacaoVisivel ? totalGeralCartas() : 0,
       fonteDividasGlobal: "cartas-julho-2026",
+      // ── Metadados de visibilidade de faturação ─────────────────────────────
+      // O frontend usa estes campos para saber se deve exibir os valores do mês
+      // de faturação ou mostrar apenas os saldos do mês corrente.
+      faturacaoVisivel,
+      faturacaoMes: CARTAS_MES,
+      faturacaoAno: CARTAS_ANO,
 
       // ── SALDO OPERACIONAL (nova gaveta de topo) ─────────────────────────────
       // saldoContaCorrenteTotal   = saldo físico Conta à Ordem (inclui cativos)
