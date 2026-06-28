@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { db } from "../database";
 import * as schema from "../database/schema";
-import { eq, and, sql, gt, gte } from "drizzle-orm";
+import { eq, and, sql, gt, gte, inArray } from "drizzle-orm";
 import {
   REGRAS_CATIVO,
   identificarDestinoCativo,
@@ -906,29 +906,114 @@ export interface DividaFracao {
  * Retorna apenas as frações COM carta emitida e dívidas > 0.
  * Frações sem carta = em dia = não constam no resultado.
  *
- * Regra de amortização (após pagamentos recebidos):
- *   Regra A — descritor explícito → débito directo à rubrica nomeada.
- *   Regra B — genérico: 1.º CC → 2.º FR → 3.º Obras/Motor/Incêndio.
- *
- * Nota: neste momento não deduzimos pagamentos pós-carta da DB porque:
- *   a) os pagamentos são registados pelo motor matricial em quotas.tipo='condominio'
- *   b) a cascata de amortização (processarCascataAmortizacao) actualiza as gavetas
- *   c) as cartas são o snapshot de dívida emitido — pagamentos posteriores são tracked
- *      separadamente via quotas+bank_transactions
+ * Amortização pós-carta (pagamentos recebidos desde 26/06/2026):
+ *   Cascata genérica: 1.º CC (quotaJulho) → 2.º FR (fundoReservaJulho)
+ *                     → 3.º Obras → 4.º Motor → 5.º Incêndio.
+ *   Fonte: quotas pago=true com dataPagamento >= 26/06/2026, ligadas à fração.
  */
+
+// unix timestamp de 26/06/2026 00:00:00 UTC — âncora de pagamentos pós-carta
+const ANCORA_PAGAMENTOS_CARTA_TS = 1750896000;
+
 export async function calcularDividasIndividuais(): Promise<Record<string, DividaFracao>> {
+  // ── 1. Ler pagamentos confirmados desde 26/06/2026 ─────────────────────────
+  // Junta bank_transactions importadas (imported=1, amount>0, date>=âncora)
+  // com o importRefId → quotas.id → quotas.fracaoId → fracoes.numero
+  // para identificar a fração e o montante pago.
+  // Usa bank_transactions como fonte primária (captura todos os pagamentos
+  // importados pelo motor, incluindo parciais).
+  let pagamentosPorFracao: Map<string, number> = new Map();
+  try {
+    const txRows = await db
+      .select({
+        amount:   schema.bankTransactions.amount,
+        quotaId:  schema.bankTransactions.importRefId,
+      })
+      .from(schema.bankTransactions)
+      .where(and(
+        sql`${schema.bankTransactions.date} >= ${ANCORA_PAGAMENTOS_CARTA_TS}`,
+        sql`${schema.bankTransactions.amount} > 0`,
+        eq(schema.bankTransactions.imported, 1),
+      ));
+
+    // Para cada tx importada, resolver fracaoNumero via importRefId → quota
+    const quotaIds = txRows
+      .map(r => r.quotaId)
+      .filter((id): id is string => !!id);
+
+    if (quotaIds.length > 0) {
+      // Buscar fracaoId de cada quota referenciada
+      const quotaRows = await db
+        .select({
+          id:       schema.quotas.id,
+          fracaoId: schema.quotas.fracaoId,
+        })
+        .from(schema.quotas)
+        .where(inArray(schema.quotas.id, quotaIds));
+
+      const quotaFracaoMap = new Map<string, string>(quotaRows.map(q => [q.id, q.fracaoId]));
+
+      // Buscar numero da fração
+      const fracaoIds = [...new Set(quotaRows.map(q => q.fracaoId))];
+      const fracaoRows = fracaoIds.length > 0
+        ? await db
+          .select({ id: schema.fracoes.id, numero: schema.fracoes.numero })
+          .from(schema.fracoes)
+          .where(inArray(schema.fracoes.id, fracaoIds))
+        : [];
+      const fracaoNumMap = new Map<string, string>(fracaoRows.map(f => [f.id, f.numero ?? f.id]));
+
+      for (const tx of txRows) {
+        if (!tx.quotaId) continue;
+        const fracaoId = quotaFracaoMap.get(tx.quotaId);
+        if (!fracaoId) continue;
+        const num = fracaoNumMap.get(fracaoId);
+        if (!num) continue;
+        const key = num.toUpperCase();
+        pagamentosPorFracao.set(key, (pagamentosPorFracao.get(key) ?? 0) + (tx.amount ?? 0));
+      }
+    }
+  } catch (e) {
+    console.warn("[calcularDividasIndividuais] Falha ao ler pagamentos pós-carta:", e);
+    // Continua sem abater — mostra valores brutos da carta
+  }
+
+  // ── 2. Construir resultado abatendo pagamentos em cascata ──────────────────
   const resultado: Record<string, DividaFracao> = {};
 
   for (const carta of CARTAS_JULHO_2026) {
     const id = carta.fracao.toUpperCase();
-    // Só incluir frações com pelo menos uma rubrica em dívida
-    if (carta.obras === 0 && carta.motor === 0 && carta.incendio === 0 && carta.quotasCC_atraso === 0) {
-      continue;
+
+    // Valores brutos da carta
+    let cc      = carta.quotaJulho + carta.quotasCC_atraso;
+    let fr      = carta.fundoReservaJulho;
+    let obras   = carta.obras;
+    let motor   = carta.motor;
+    let incendio = carta.incendio;
+
+    // Abater pagamentos recebidos desde 26/06/2026 (cascata)
+    let restante = pagamentosPorFracao.get(id) ?? 0;
+    if (restante > 0) {
+      const abate = (val: number): number => {
+        if (restante <= 0) return val;
+        const d = Math.min(restante, val);
+        restante -= d;
+        return Math.round((val - d) * 100) / 100;
+      };
+      cc       = abate(cc);
+      fr       = abate(fr);
+      obras    = abate(obras);
+      motor    = abate(motor);
+      incendio = abate(incendio);
     }
+
+    // Só incluir se ainda há dívida em pelo menos uma rubrica de extras
+    if (obras === 0 && motor === 0 && incendio === 0 && cc === 0 && fr === 0) continue;
+
     resultado[id] = {
-      obras:      Math.round(carta.obras    * 100) / 100,
-      motor:      Math.round(carta.motor    * 100) / 100,
-      incendio:   Math.round(carta.incendio * 100) / 100,
+      obras:      Math.round(obras    * 100) / 100,
+      motor:      Math.round(motor    * 100) / 100,
+      incendio:   Math.round(incendio * 100) / 100,
       elevadores: 0, // INDAQUA/elevadores tratados via INDAQUA_DEVEDORES_EXCEL separadamente
     };
   }
@@ -1361,6 +1446,97 @@ export const dashboard = new Hono()
       incendioAReceberDinamico = Math.round(incendioMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
     }
 
+    // --- CONTA CORRENTE (morosos) — fonte: cartas de julho ─────────────────
+    // Usa cartasMorosos.contaCorrente (quotasCC_atraso > 0) como base.
+    // Complementa com frações que têm quotaJulho e ainda não pagaram (julho corrente).
+    // Se não há dados de cartas, cai no fallback BD (morosos).
+    let ccMorososDinamico: Array<{ fracao: any; quotas: any[]; total: number }>;
+    let ccTotalEmAtraso: number;
+    let ccFracoesEmAtraso: number;
+
+    if (cartasMorosos.contaCorrente.length > 0 || CARTAS_JULHO_2026.some(c => c.quotaJulho > 0)) {
+      // Frações com atraso histórico (quotasCC_atraso > 0) das cartas
+      const ccHistorico = cartasMorosos.contaCorrente;
+      // Frações que devem quota de julho mas ainda não pagaram (quotaJulho > 0 e não estão já no histórico)
+      // Cruzar com quotas BD pago=true para mes=7, ano=2026
+      const julhoPagasRows = await db
+        .select({ numero: schema.fracoes.numero })
+        .from(schema.quotas)
+        .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
+        .where(and(
+          eq(schema.quotas.tipo, "condominio"),
+          eq(schema.quotas.mes, 7),
+          eq(schema.quotas.ano, 2026),
+          eq(schema.quotas.pago, true),
+        ));
+      const julhoPagosNums = new Set(julhoPagasRows.map(r => r.numero).filter(Boolean));
+
+      // Frações com quotaJulho não paga (não constam nos pagos e têm quotaJulho > 0)
+      const historicNums = new Set(ccHistorico.map(m => m.fracao.toUpperCase()));
+      const julhoMorosos = CARTAS_JULHO_2026
+        .filter(c => c.quotaJulho > 0 && !julhoPagosNums.has(c.fracao) && !historicNums.has(c.fracao.toUpperCase()))
+        .map(c => ({
+          fracao: { id: c.fracao, numero: c.fracao, proprietarioNome: c.proprietario, andar: 0 },
+          total: Math.round((c.quotaJulho + c.fundoReservaJulho) * 100) / 100,
+          quotas: [],
+        }));
+
+      const ccHistoricoFormatado = ccHistorico.map(m => ({
+        fracao: { id: m.fracao, numero: m.fracao, proprietarioNome: m.proprietario, andar: 0 },
+        total: m.total,
+        quotas: [],
+      }));
+
+      ccMorososDinamico = [...ccHistoricoFormatado, ...julhoMorosos]
+        .sort((a, b) => b.total - a.total);
+      ccTotalEmAtraso = Math.round(ccMorososDinamico.reduce((s, m) => s + m.total, 0) * 100) / 100;
+      ccFracoesEmAtraso = ccMorososDinamico.length;
+    } else {
+      // Fallback: BD quotas (comportamento anterior)
+      ccMorososDinamico = morosos;
+      ccTotalEmAtraso = totalMorosos;
+      ccFracoesEmAtraso = morosos.length;
+    }
+
+    // --- FUNDO DE RESERVA (morosos) — fonte: cartas de julho ────────────────
+    // Todas as cartas têm fundoReservaJulho > 0.
+    // Morosos = frações que não pagaram FR julho (cruzar com quotas BD pago=true)
+    let frMorososDinamico: Array<{ fracao: any; quotas: any[]; total: number }>;
+    let frTotalEmAtraso: number;
+    let frFracoesEmAtraso: number;
+
+    if (CARTAS_JULHO_2026.some(c => c.fundoReservaJulho > 0)) {
+      // Frações que pagaram FR julho na BD
+      const frPagasRows = await db
+        .select({ numero: schema.fracoes.numero, fundoReserva: schema.quotas.fundoReserva })
+        .from(schema.quotas)
+        .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
+        .where(and(
+          eq(schema.quotas.tipo, "condominio"),
+          eq(schema.quotas.mes, 7),
+          eq(schema.quotas.ano, 2026),
+          eq(schema.quotas.pago, true),
+        ));
+      const frPagosNums = new Set(frPagasRows.map(r => r.numero).filter(Boolean));
+
+      frMorososDinamico = CARTAS_JULHO_2026
+        .filter(c => c.fundoReservaJulho > 0 && !frPagosNums.has(c.fracao))
+        .map(c => ({
+          fracao: { id: c.fracao, numero: c.fracao, proprietarioNome: c.proprietario, andar: 0 },
+          total: Math.round(c.fundoReservaJulho * 100) / 100,
+          quotas: [],
+        }))
+        .sort((a, b) => b.total - a.total);
+
+      frTotalEmAtraso = Math.round(frMorososDinamico.reduce((s, m) => s + m.total, 0) * 100) / 100;
+      frFracoesEmAtraso = frMorososDinamico.length;
+    } else {
+      // Fallback: estático Excel
+      frMorososDinamico = FUNDO_RESERVA_DEVEDORES_EXCEL;
+      frTotalEmAtraso   = saldos.atraso_fundo_reserva ?? 7.21;
+      frFracoesEmAtraso = FUNDO_RESERVA_DEVEDORES_EXCEL.length;
+    }
+
     return c.json({
       mesAtual,
       anoAtual,
@@ -1381,10 +1557,11 @@ export const dashboard = new Hono()
       orcamentoMensal,
       // Secções
       contaCorrente: {
-        totalEmAtraso: totalMorosos,
-        fracoesEmAtraso: morosos.length,
-        morosos,
+        totalEmAtraso: ccTotalEmAtraso,
+        fracoesEmAtraso: ccFracoesEmAtraso,
+        morosos: ccMorososDinamico,
         saldoConta: saldos.saldo_conta_corrente,
+        fonteDados: cartasMorosos.contaCorrente.length > 0 ? "cartas" : "bd",
       },
       obras: {
         totalPago: totalObrasPago,
@@ -1399,8 +1576,10 @@ export const dashboard = new Hono()
       extras: extrasSecoes,
       fundoReserva: {
         saldoConta: saldos.saldo_fundo_reserva,
-        totalEmAtraso: saldos.atraso_fundo_reserva,
-        morosos: FUNDO_RESERVA_DEVEDORES_EXCEL,
+        totalEmAtraso: frTotalEmAtraso,
+        fracoesEmAtraso: frFracoesEmAtraso,
+        morosos: frMorososDinamico,
+        fonteDados: CARTAS_JULHO_2026.some(c => c.fundoReservaJulho > 0) ? "cartas" : "excel",
       },
       incendio: {
         // Fonte: cartas de cobrança emitidas (CARTAS_JULHO_2026)
@@ -1486,10 +1665,14 @@ export const dashboard = new Hono()
   .post("/recalcular", async (c) => {
     try {
       await recalcularSaldos();
+      const dividasIndividuais = await calcularDividasIndividuais();
       const saldos = await getSaldos();
       return c.json({
         ok: true,
         mensagem: "Saldos recalculados com sucesso",
+        timestamp: Date.now(),
+        invalidateKeys: ["dashboard", "morosos"],
+        dividasIndividuais,
         saldos: {
           saldo_conta_corrente:        saldos.saldo_conta_corrente,
           saldo_fundo_reserva:         saldos.saldo_fundo_reserva,
