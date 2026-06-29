@@ -1465,13 +1465,15 @@ export const dashboard = new Hono()
       }));
       incendioAReceberDinamico = Math.round(incendioMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
     } else {
-      const incPagosRows = await db
-        .select({ numero: schema.fracoes.numero })
-        .from(schema.quotas)
-        .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
-        .where(and(eq(schema.quotas.tipo, "extra"), eq(schema.quotas.quotaTipoId, INCENDIO_TIPO_ID), eq(schema.quotas.pago, true)));
-      const incPagosNums = new Set(incPagosRows.map(r => r.numero).filter(Boolean));
-      incendioMorososDinamico = INCENDIO_DEVEDORES_EXCEL.filter(d => !incPagosNums.has(d.fracao.numero));
+      // Fallback: fracoes.incendio_divida (seeded do Excel — baseline Junho 2026)
+      const incDividaBD = await db
+        .select({ numero: schema.fracoes.numero, proprietarioNome: schema.fracoes.proprietarioNome, andar: schema.fracoes.andar, incendioDivida: schema.fracoes.incendioDivida })
+        .from(schema.fracoes).where(gt(schema.fracoes.incendioDivida, 0));
+      incendioMorososDinamico = incDividaBD.map(r => ({
+        fracao: { id: r.numero!, numero: r.numero!, proprietarioNome: r.proprietarioNome ?? "", andar: r.andar ?? 0 },
+        total: Math.round((r.incendioDivida ?? 0) * 100) / 100,
+        quotas: [],
+      })).sort((a, b) => b.total - a.total);
       incendioAReceberDinamico = Math.round(incendioMorososDinamico.reduce((s, d) => s + d.total, 0) * 100) / 100;
     }
 
@@ -1483,7 +1485,7 @@ export const dashboard = new Hono()
     let ccTotalEmAtraso: number;
     let ccFracoesEmAtraso: number;
 
-    if (cartasMorosos.contaCorrente.length > 0 || CARTAS_JULHO_2026.some(c => c.quotaJulho > 0)) {
+    if (cartasMorosos.contaCorrente.length > 0 || (faturacaoVisivel && CARTAS_JULHO_2026.some(c => c.quotaJulho > 0))) {
       // Frações com atraso histórico (quotasCC_atraso > 0) das cartas
       const ccHistorico = cartasMorosos.contaCorrente;
       // Frações que devem quota de julho mas ainda não pagaram (quotaJulho > 0 e não estão já no histórico)
@@ -1534,7 +1536,7 @@ export const dashboard = new Hono()
     let frTotalEmAtraso: number;
     let frFracoesEmAtraso: number;
 
-    if (CARTAS_JULHO_2026.some(c => c.fundoReservaJulho > 0)) {
+    if (faturacaoVisivel && CARTAS_JULHO_2026.some(c => c.fundoReservaJulho > 0)) {
       // Frações que pagaram FR julho na BD
       const frPagasRows = await db
         .select({ numero: schema.fracoes.numero, fundoReserva: schema.quotas.fundoReserva })
