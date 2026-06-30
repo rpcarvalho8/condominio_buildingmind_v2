@@ -1590,10 +1590,49 @@ export const dashboard = new Hono()
       frTotalEmAtraso = Math.round(frMorososDinamico.reduce((s, m) => s + m.total, 0) * 100) / 100;
       frFracoesEmAtraso = frMorososDinamico.length;
     } else {
-      // Fallback: estático Excel
-      frMorososDinamico = FUNDO_RESERVA_DEVEDORES_EXCEL;
-      frTotalEmAtraso   = saldos.atraso_fundo_reserva ?? 7.21;
-      frFracoesEmAtraso = FUNDO_RESERVA_DEVEDORES_EXCEL.length;
+      // Fallback dinâmico: quotas.fundo_reserva não pagas de 2026 agrupadas por fração
+      const frQuotasEmAtraso = await db
+        .select({
+          quota: schema.quotas,
+          fracao: schema.fracoes,
+        })
+        .from(schema.quotas)
+        .leftJoin(schema.fracoes, eq(schema.quotas.fracaoId, schema.fracoes.id))
+        .where(
+          and(
+            eq(schema.quotas.tipo, "condominio"),
+            eq(schema.quotas.pago, false),
+            sql`${schema.quotas.ano} >= 2026`,
+            sql`${schema.quotas.fundoReserva} > 0`
+          )
+        );
+
+      const frMap = new Map<string, { fracao: any; total: number }>();
+      for (const row of frQuotasEmAtraso) {
+        if (!row.fracao) continue;
+        const id = row.fracao.id;
+        if (!frMap.has(id)) {
+          frMap.set(id, { fracao: row.fracao, total: 0 });
+        }
+        frMap.get(id)!.total += row.quota.fundoReserva ?? 0;
+      }
+
+      frMorososDinamico = Array.from(frMap.values())
+        .map(e => ({
+          fracao: {
+            id: e.fracao.id,
+            numero: e.fracao.numero ?? "",
+            proprietarioNome: e.fracao.proprietarioNome ?? "",
+            andar: e.fracao.andar ?? 0,
+          },
+          total: Math.round(e.total * 100) / 100,
+          quotas: [],
+        }))
+        .filter(e => e.total > 0)
+        .sort((a, b) => b.total - a.total);
+
+      frTotalEmAtraso = Math.round(frMorososDinamico.reduce((s, m) => s + m.total, 0) * 100) / 100;
+      frFracoesEmAtraso = frMorososDinamico.length;
     }
 
     return c.json({
