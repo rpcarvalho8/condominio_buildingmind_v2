@@ -147,9 +147,14 @@ export default function DashboardPage() {
     <>
       <SyncBanner isSyncing={isSyncing} syncError={syncError} syncDone={syncDone} />
       <Overview d={d} setSecao={setSecao} onRefresh={async () => {
+        // Timeout de 15 s — garante que o botão nunca fica congelado em offline
+        const postPromise = api.dashboard.recalcular.$post();
+        const timeoutPromise = new Promise<Response>((_, reject) =>
+          setTimeout(() => reject(new Error("timeout")), 15_000)
+        );
         try {
-          await api.dashboard.recalcular.$post();
-        } catch (_) { /* ignora erros de rede — o GET vai mostrar o estado actual */ }
+          await Promise.race([postPromise, timeoutPromise]);
+        } catch (_) { /* ignora erros de rede e timeouts — o GET mostra estado actual */ }
         await qc.invalidateQueries({ queryKey: ["dashboard"] });
       }} />
     </>

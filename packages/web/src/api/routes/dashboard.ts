@@ -227,12 +227,15 @@ const SALDO_DEFAULTS: Record<string, number> = {
   cativo_obras: 0,
   // saldo_operacional_disponivel = saldo_conta_corrente − soma de todos os cativos
   saldo_operacional_disponivel: ANCORA_SALDO_CC,
-  // ── Dívida global por cota extraordinária (orçamento − total arrecadado) ──
-  // Calculados dinamicamente em recalcularSaldos() com base nos ORCAMENTOS_*.
-  divida_total_motor:      ORCAMENTO_MOTOR,
-  divida_total_incendio:   ORCAMENTO_INCENDIO,
-  divida_total_elevadores: ORCAMENTO_ELEVADORES,
-  divida_total_obras:      ORCAMENTO_OBRAS,
+  // ── Dívida global por cota extraordinária ────────────────────────────────────
+  // DEFAULTS SEGUROS: totais das listas Excel (fracoes.* seeded), NÃO o orçamento completo.
+  // recalcularSaldos() persiste valores correctos na tabela configuracoes;
+  // estes defaults só são usados se recalcularSaldos() ainda não correu (first boot).
+  // Fonte: OBRAS_DEVEDORES_EXCEL, MOTOR_DEVEDORES_EXCEL, INCENDIO_DEVEDORES_EXCEL, INDAQUA_DEVEDORES_EXCEL
+  divida_total_motor:      98.48,    // SUM(fracoes.motor_divida)
+  divida_total_incendio:   110.12,   // SUM(fracoes.incendio_divida)
+  divida_total_elevadores: 308.21,   // SUM(fracoes.indaqua_divida)
+  divida_total_obras:      4357.75,  // SUM(fracoes.obras_divida) — seeded do Excel Junho 2026
 };
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -831,17 +834,39 @@ export async function recalcularSaldos(): Promise<void> {
 
   // ─────────────────────────────────────────────────────────────────────────────
   // 9. MOROSIDADE GLOBAL POR COTA EXTRAORDINÁRIA
-  //    divida_total = orcamento_aprovado − total_arrecadado (quotas pago=true)
-  //    Cálculo automático sem depender das listas Excel — usa a DB como fonte.
+  //    REGRA PROTEÇÃO OFFLINE: se não existem quotas importadas para uma rubrica
+  //    (total_arrecadado = 0), NÃO fazemos reset para ORCAMENTO_* completo.
+  //    Em vez disso, usamos SUM(fracoes.*_divida) como baseline — esses valores
+  //    foram seeded directamente do Excel e representam a dívida real conhecida.
+  //    Só usamos ORCAMENTO − total_arrecadado quando total_arrecadado > 0
+  //    (i.e., existem quotas pagas na DB que provam que o sync correu correctamente).
   // ─────────────────────────────────────────────────────────────────────────────
   try {
+    // ── Baseline a partir da tabela fracoes (seeded do Excel) ──────────────────
+    const fracoesDividaRows = await db
+      .select({
+        obrasDivida:    schema.fracoes.obrasDivida,
+        motorDivida:    schema.fracoes.motorDivida,
+        incendioDivida: schema.fracoes.incendioDivida,
+        indaquaDivida:  schema.fracoes.indaquaDivida,
+      })
+      .from(schema.fracoes);
+
+    const baselineObras    = Math.round(fracoesDividaRows.reduce((s, r) => s + (r.obrasDivida    ?? 0), 0) * 100) / 100;
+    const baselineMotor    = Math.round(fracoesDividaRows.reduce((s, r) => s + (r.motorDivida    ?? 0), 0) * 100) / 100;
+    const baselineIncendio = Math.round(fracoesDividaRows.reduce((s, r) => s + (r.incendioDivida ?? 0), 0) * 100) / 100;
+    const baselineElev     = Math.round(fracoesDividaRows.reduce((s, r) => s + (r.indaquaDivida  ?? 0), 0) * 100) / 100;
+
     // Motor (Portão) — quotaTipoId = PORTAO_TIPO_ID
     const motorPagoRows = await db
       .select({ valor: schema.quotas.valor })
       .from(schema.quotas)
       .where(and(eq(schema.quotas.quotaTipoId, PORTAO_TIPO_ID), eq(schema.quotas.pago, true)));
     const totalMotorArrecadado = Math.round(motorPagoRows.reduce((s, q) => s + q.valor, 0) * 100) / 100;
-    const dividaMotor = Math.max(0, Math.round((ORCAMENTO_MOTOR - totalMotorArrecadado) * 100) / 100);
+    // PROTEÇÃO: só subtrai do orçamento se há quotas importadas; caso contrário usa baseline
+    const dividaMotor = totalMotorArrecadado > 0
+      ? Math.max(0, Math.round((ORCAMENTO_MOTOR - totalMotorArrecadado) * 100) / 100)
+      : baselineMotor;
     await upsertSaldo("divida_total_motor", dividaMotor);
 
     // Incêndio — quotaTipoId = INCENDIO_TIPO_ID
@@ -850,7 +875,9 @@ export async function recalcularSaldos(): Promise<void> {
       .from(schema.quotas)
       .where(and(eq(schema.quotas.quotaTipoId, INCENDIO_TIPO_ID), eq(schema.quotas.pago, true)));
     const totalIncendioArrecadado = Math.round(incendioPagoRows.reduce((s, q) => s + q.valor, 0) * 100) / 100;
-    const dividaIncendio = Math.max(0, Math.round((ORCAMENTO_INCENDIO - totalIncendioArrecadado) * 100) / 100);
+    const dividaIncendio = totalIncendioArrecadado > 0
+      ? Math.max(0, Math.round((ORCAMENTO_INCENDIO - totalIncendioArrecadado) * 100) / 100)
+      : baselineIncendio;
     await upsertSaldo("divida_total_incendio", dividaIncendio);
 
     // Elevadores — quotaTipoId = ELEV_TIPO_ID
@@ -859,7 +886,9 @@ export async function recalcularSaldos(): Promise<void> {
       .from(schema.quotas)
       .where(and(eq(schema.quotas.quotaTipoId, ELEV_TIPO_ID), eq(schema.quotas.pago, true)));
     const totalElevArrecadado = Math.round(elevPagoRows2.reduce((s, q) => s + q.valor, 0) * 100) / 100;
-    const dividaElevadores = Math.max(0, Math.round((ORCAMENTO_ELEVADORES - totalElevArrecadado) * 100) / 100);
+    const dividaElevadores = totalElevArrecadado > 0
+      ? Math.max(0, Math.round((ORCAMENTO_ELEVADORES - totalElevArrecadado) * 100) / 100)
+      : baselineElev;
     await upsertSaldo("divida_total_elevadores", dividaElevadores);
 
     // Obras — tipo='obras'
@@ -868,14 +897,14 @@ export async function recalcularSaldos(): Promise<void> {
       .from(schema.quotas)
       .where(and(eq(schema.quotas.tipo, "obras"), eq(schema.quotas.pago, true)));
     const totalObrasArrecadado = Math.round(obrasPagoRows.reduce((s, q) => s + q.valor, 0) * 100) / 100;
-    const dividaObras = Math.max(0, Math.round((ORCAMENTO_OBRAS - totalObrasArrecadado) * 100) / 100);
+    const dividaObras = totalObrasArrecadado > 0
+      ? Math.max(0, Math.round((ORCAMENTO_OBRAS - totalObrasArrecadado) * 100) / 100)
+      : baselineObras;
     await upsertSaldo("divida_total_obras", dividaObras);
 
     console.log(
-      `[recalcularSaldos] Dívidas globais — Motor:${dividaMotor}€/${ORCAMENTO_MOTOR}€ ` +
-      `Incêndio:${dividaIncendio}€/${ORCAMENTO_INCENDIO}€ ` +
-      `Elevadores:${dividaElevadores}€/${ORCAMENTO_ELEVADORES}€ ` +
-      `Obras:${dividaObras}€/${ORCAMENTO_OBRAS}€`
+      `[recalcularSaldos] Dívidas globais (baseline fracoes: Obras=${baselineObras}€ Motor=${baselineMotor}€ Incêndio=${baselineIncendio}€ Elev=${baselineElev}€)` +
+      ` → Motor:${dividaMotor}€ Incêndio:${dividaIncendio}€ Elevadores:${dividaElevadores}€ Obras:${dividaObras}€`
     );
   } catch (e) {
     console.error("[recalcularSaldos] morosidade global:", e);
@@ -1699,36 +1728,58 @@ export const dashboard = new Hono()
     }, 200);
   })
   // POST /recalcular — força recalculo de todos os saldos e persiste em configuracoes
+  // PROTEÇÃO TIMEOUT: responde em no máximo 12 s mesmo que o banco esteja offline.
+  // O frontend invalida o React Query após receber 200 — liberta sempre o botão.
   .post("/recalcular", async (c) => {
+    const timeout = new Promise<void>((_, reject) =>
+      setTimeout(() => reject(new Error("recalcular timeout")), 12_000)
+    );
     try {
-      await recalcularSaldos();
-      const dividasIndividuais = await calcularDividasIndividuais();
-      const saldos = await getSaldos();
-      return c.json({
-        ok: true,
-        mensagem: "Saldos recalculados com sucesso",
-        timestamp: Date.now(),
-        invalidateKeys: ["dashboard", "morosos"],
-        dividasIndividuais,
-        saldos: {
-          saldo_conta_corrente:        saldos.saldo_conta_corrente,
-          saldo_fundo_reserva:         saldos.saldo_fundo_reserva,
-          saldo_obras:                 saldos.saldo_obras,
-          saldo_quota_extra:           saldos.saldo_quota_extra,
-          saldo_operacional_disponivel: saldos.saldo_operacional_disponivel,
-          atraso_fundo_reserva:        saldos.atraso_fundo_reserva,
-          a_receber_obras:             saldos.a_receber_obras,
-          a_receber_quota_extra:       saldos.a_receber_quota_extra,
-          a_receber_portao:            saldos.a_receber_portao,
-          cativo_fundo_reserva:        saldos.cativo_fundo_reserva,
-          cativo_obras:                saldos.cativo_obras,
-          cativo_indaqua:              saldos.cativo_indaqua,
-        },
-      }, 200);
+      await Promise.race([recalcularSaldos(), timeout]);
     } catch (e: any) {
-      console.error("[POST /recalcular]", e);
-      return c.json({ ok: false, erro: e?.message ?? String(e) }, 500);
+      // Timeout ou erro parcial — continua para devolver saldos actuais
+      console.warn("[POST /recalcular] recalcularSaldos incompleto:", e?.message ?? e);
     }
+
+    let dividasIndividuais: Record<string, DividaFracao> = {};
+    try {
+      dividasIndividuais = await Promise.race([
+        calcularDividasIndividuais(),
+        new Promise<Record<string, DividaFracao>>((_, reject) =>
+          setTimeout(() => reject(new Error("dividasIndividuais timeout")), 5_000)
+        ),
+      ]);
+    } catch {
+      // não bloqueia — cartas podem ainda estar a ser calculadas
+    }
+
+    const saldos = await getSaldos();
+    return c.json({
+      ok: true,
+      mensagem: "Saldos recalculados com sucesso",
+      timestamp: Date.now(),
+      invalidateKeys: ["dashboard", "morosos"],
+      dividasIndividuais,
+      saldos: {
+        saldo_conta_corrente:         saldos.saldo_conta_corrente,
+        saldo_fundo_reserva:          saldos.saldo_fundo_reserva,
+        saldo_obras:                  saldos.saldo_obras,
+        saldo_quota_extra:            saldos.saldo_quota_extra,
+        saldo_operacional_disponivel: saldos.saldo_operacional_disponivel,
+        atraso_fundo_reserva:         saldos.atraso_fundo_reserva,
+        a_receber_obras:              saldos.a_receber_obras,
+        a_receber_quota_extra:        saldos.a_receber_quota_extra,
+        a_receber_portao:             saldos.a_receber_portao,
+        cativo_fundo_reserva:         saldos.cativo_fundo_reserva,
+        cativo_obras:                 saldos.cativo_obras,
+        cativo_indaqua:               saldos.cativo_indaqua,
+        // dívidas globais (protegidas contra reset offline)
+        divida_total_obras:           saldos.divida_total_obras,
+        divida_total_motor:           saldos.divida_total_motor,
+        divida_total_incendio:        saldos.divida_total_incendio,
+        divida_total_elevadores:      saldos.divida_total_elevadores,
+      },
+    }, 200);
   })
   // Quick morosos count for sidebar badge
   .get("/morosos-count", async (c) => {
