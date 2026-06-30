@@ -463,16 +463,22 @@ function Overview({ d, setSecao, onRefresh }: any) {
           <SectionLabel>Contas do condomínio</SectionLabel>
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-5 gap-3">
             {/* Conta corrente */}
-            <ContaCard
-              titulo="Conta Corrente"
-              banco="Santander Totta"
-              saldo={d.contaCorrente?.saldoConta ?? 0}
-              aReceber={d.contaCorrente?.totalEmAtraso ?? 0}
-              aReceberLabel={`${d.contaCorrente?.fracoesEmAtraso ?? 0} frações em atraso`}
-              color="blue"
-              icon={<Euro size={20} />}
-              onClick={() => setSecao("contaCorrente")}
-            />
+            {(() => {
+              const ccFromMorosos = (d.contaCorrente?.morosos ?? []).reduce((s: number, m: any) => s + (m.total ?? 0), 0);
+              const ccAReceber = Math.max(d.contaCorrente?.totalEmAtraso ?? 0, ccFromMorosos);
+              return (
+                <ContaCard
+                  titulo="Conta Corrente"
+                  banco="Santander Totta"
+                  saldo={d.contaCorrente?.saldoConta ?? 0}
+                  aReceber={ccAReceber}
+                  aReceberLabel={`${d.contaCorrente?.fracoesEmAtraso ?? (d.contaCorrente?.morosos?.length ?? 0)} frações em atraso`}
+                  color="blue"
+                  icon={<Euro size={20} />}
+                  onClick={() => setSecao("contaCorrente")}
+                />
+              );
+            })()}
             {/* Obras */}
             <ContaCard
               titulo="Obras"
@@ -525,7 +531,7 @@ function Overview({ d, setSecao, onRefresh }: any) {
               banco="Santander Totta"
               saldo={d.fundoReserva?.saldoConta ?? 0}
               aReceber={d.fundoReserva?.totalEmAtraso ?? 0}
-              aReceberLabel="em atraso"
+              aReceberLabel={`${d.fundoReserva?.fracoesEmAtraso ?? 0} frações em atraso`}
               color="green"
               icon={<PiggyBank size={20} />}
               onClick={() => setSecao("fundoReserva")}
@@ -535,37 +541,70 @@ function Overview({ d, setSecao, onRefresh }: any) {
 
         {/* ── 3. MOROSOS + GRÁFICO ──────────────────── */}
         <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
-          {/* Morosos */}
+          {/* Morosos — unified across all sources */}
           <div className="lg:col-span-2 space-y-3">
             <SectionLabel>Frações em atraso</SectionLabel>
-            {d.contaCorrente?.morosos?.length > 0 ? (
-              <Card>
-                <div className="divide-y" style={{ borderColor: "var(--border)" }}>
-                  {d.contaCorrente.morosos.slice(0, 6).map((m: any) => (
-                    <MorososRow key={m.fracao.id} m={m} />
-                  ))}
-                  {d.contaCorrente.morosos.length > 6 && (
-                    <button
-                      onClick={() => setSecao("contaCorrente")}
-                      className="w-full py-3 text-xs text-center hover:opacity-70 transition-opacity"
-                      style={{ color: "var(--blue-bright)" }}
-                    >
-                      Ver todos ({d.contaCorrente.morosos.length}) →
-                    </button>
-                  )}
-                </div>
-              </Card>
-            ) : (
-              <Card>
-                <CardContent className="flex items-center gap-3 py-6">
-                  <CheckCircle2 size={24} style={{ color: "var(--green)" }} />
-                  <div>
-                    <p className="text-sm font-medium" style={{ color: "var(--text-primary)" }}>Tudo em dia</p>
-                    <p className="text-xs" style={{ color: "var(--text-muted)" }}>Sem morosos este mês</p>
+            {(() => {
+              // Merge devedores by fracao.numero across all sources
+              const devedoresMap = new Map<string, { fracao: any; total: number }>();
+              const addMorosos = (list: any[] | undefined) => {
+                if (!list) return;
+                for (const m of list) {
+                  const num: string = m.fracao?.numero ?? m.fracao?.id ?? "?";
+                  const existing = devedoresMap.get(num);
+                  if (existing) {
+                    existing.total += m.total ?? 0;
+                  } else {
+                    devedoresMap.set(num, { fracao: m.fracao, total: m.total ?? 0 });
+                  }
+                }
+              };
+              addMorosos(d.contaCorrente?.morosos);
+              addMorosos(d.fundoReserva?.morosos);
+              addMorosos(d.obras?.morosos);
+              addMorosos(d.motor?.morosos);
+              addMorosos(d.incendio?.morosos);
+              addMorosos(d.quotaExtra?.morosos);
+
+              const devedores = Array.from(devedoresMap.values())
+                .filter((x) => x.total > 0)
+                .sort((a, b) => (a.fracao?.numero ?? "").localeCompare(b.fracao?.numero ?? ""));
+
+              if (devedores.length === 0) {
+                return (
+                  <Card>
+                    <CardContent className="flex items-center gap-3 py-6">
+                      <CheckCircle2 size={24} style={{ color: "var(--green)" }} />
+                      <div>
+                        <p className="text-sm font-medium" style={{ color: "var(--text-primary)" }}>Tudo em dia</p>
+                        <p className="text-xs" style={{ color: "var(--text-muted)" }}>Sem morosos este mês</p>
+                      </div>
+                    </CardContent>
+                  </Card>
+                );
+              }
+
+              const visible = devedores.slice(0, 6);
+              const rest = devedores.length - visible.length;
+              return (
+                <Card>
+                  <div className="divide-y" style={{ borderColor: "var(--border)" }}>
+                    {visible.map((dev) => (
+                      <MorososRow key={dev.fracao?.numero ?? dev.fracao?.id} m={dev} />
+                    ))}
+                    {rest > 0 && (
+                      <button
+                        onClick={() => setSecao("contaCorrente")}
+                        className="w-full py-3 text-xs text-center hover:opacity-70 transition-opacity"
+                        style={{ color: "var(--blue-bright)" }}
+                      >
+                        Ver todos ({devedores.length}) →
+                      </button>
+                    )}
                   </div>
-                </CardContent>
-              </Card>
-            )}
+                </Card>
+              );
+            })()}
           </div>
 
           {/* Gráfico evolução */}
